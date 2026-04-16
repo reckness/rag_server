@@ -10,7 +10,7 @@ start_time = time.time()
 
 headers = {
     "Content-Type": "application/json",
-    "Authorization": "Bearer 7257b5ab-1cd1-424e-902d-79d08bc11442"
+    "Authorization": "Bearer "
 }
 
 payload = {

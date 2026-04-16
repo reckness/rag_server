@@ -93,7 +93,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             url = "http://10.1.141.33:8001/v1/chat/completions"
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": "Bearer 7257b5ab-1cd1-424e-902d-79d08bc11442"
+                "Authorization": "Bearer "
             }
             payload = {
                 "model": "Qwen3-8B",
@@ -212,7 +212,7 @@ async def llm_acompletion(model, prompt):
             url = "http://10.1.141.33:8001/v1/chat/completions"
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": "Bearer 7257b5ab-1cd1-424e-902d-79d08bc11442"
+                "Authorization": "Bearer "
             }
             payload = {
                 "model": "Qwen3-8B",

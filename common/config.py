@@ -13,8 +13,7 @@ ELASTICSEARCH_INDEX = "page_index"
 ELASTICSEARCH_SUMMARY_INDEX = "doc_summary_index"
 
 # API 配置
-API_KEY="sk-2bf2356e4ccb4a6ea43b7ab433940c10"
-#sk-e67508f09d47445cabc0d7bcc4afcf16
+API_KEY=""
 
 DEEPSEEK_API_URL="https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_V3_MODEL_NAME="deepseek-chat"
