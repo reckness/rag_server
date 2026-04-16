@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  # 基础镜像构建服务
+  doc_parser_service_base:
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    image: doc_parser_service_base:1.0
+    container_name: doc_parser_service_base
+    command: "echo Base image built successfully"
+
+  # 主服务
+  doc_parser_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: doc_parser_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./models:/app/models:ro
+      - ./pdf:/app/pdf
+      - ./rag/json:/app/rag/json
+    depends_on:
+      - doc_parser_service_base
+    restart: unless-stopped

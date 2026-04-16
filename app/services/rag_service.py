@@ -9,6 +9,73 @@ from common.doc_store.es_conn_pool import ES_CONN
 from common.config import ELASTICSEARCH_INDEX
 
 
+class ScoreNormalizer:
+    def __init__(self, method='minmax'):
+        """
+        method: 'minmax', 'zscore', 'percentile'
+        """
+        self.method = method
+        
+    def normalize(self, results: List[Dict]) -> List[Dict]:
+        """归一化搜索结果中的 _score"""
+        
+        if not results:
+            return results
+            
+        # 提取所有分数
+        scores = [hit['_score'] for hit in results]
+        
+        if self.method == 'minmax':
+            normalized_scores = self._minmax_normalize(scores)
+        elif self.method == 'zscore':
+            normalized_scores = self._zscore_normalize(scores)
+        elif self.method == 'percentile':
+            normalized_scores = self._percentile_normalize(scores)
+        else:
+            normalized_scores = scores
+            
+        # 更新结果中的分数，将归一化后的分数直接赋值给 _score
+        for hit, norm_score in zip(results, normalized_scores):
+            hit['_score'] = norm_score
+            
+        return results
+    
+    def _minmax_normalize(self, scores: List[float]) -> List[float]:
+        """Min-Max 归一化到 [0, 1]"""
+        min_score = min(scores)
+        max_score = max(scores)
+        
+        if max_score == min_score:
+            return [1.0] * len(scores)
+            
+        return [(s - min_score) / (max_score - min_score) for s in scores]
+    
+    def _zscore_normalize(self, scores: List[float]) -> List[float]:
+        """Z-Score 归一化"""
+        import statistics
+        
+        mean = statistics.mean(scores)
+        stdev = statistics.stdev(scores) if len(scores) > 1 else 1.0
+        
+        if stdev == 0:
+            return [0.0] * len(scores)
+            
+        # 使用 tanh 将结果映射到 [-1, 1] 范围
+        zscores = [(s - mean) / stdev for s in scores]
+        return [max(-1.0, min(1.0, z)) for z in zscores]
+    
+    def _percentile_normalize(self, scores: List[float]) -> List[float]:
+        """百分位归一化（基于排名）"""
+        sorted_scores = sorted(scores)
+        score_to_percentile = {}
+        
+        for i, score in enumerate(sorted_scores):
+            percentile = i / (len(sorted_scores) - 1) if len(sorted_scores) > 1 else 1.0
+            score_to_percentile[score] = percentile
+            
+        return [score_to_percentile[score] for score in scores]
+
+
 class RagService:
 
     def __init__(self):
@@ -46,10 +113,19 @@ class RagService:
         # 3️⃣ chunk召回（混合检索）
         chunks = self.es.retrieve_chunks(query, query_vec, doc_ids)
 
+        # 3.5️⃣ 分数归一化
+        normalizer = ScoreNormalizer(method='minmax')
+        chunks = normalizer.normalize(chunks)
+
+        # 3.6️⃣ 过滤分数低于0.6的chunks
+        chunks = [chunk for chunk in chunks if chunk.get("_score", 0) >= 0.6]
+
         # 4️⃣ rerank（可选）
         if req.use_rerank:
             try:
                 chunks = await rerank(query, chunks, model)
+                # 过滤分数低于0.6的chunks
+                chunks = [chunk for chunk in chunks if chunk.get("rerank_score", 0) >= 0.6]
             except ImportError as e:
                 # 处理缺少依赖的情况
                 print(f"Rerank not available: {e}")

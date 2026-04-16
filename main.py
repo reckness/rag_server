@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     app.state.model = load_model()
     
     # 处理上传的文档
-    await process_uploaded_documents()
+    #await process_uploaded_documents()
     
     yield
     # 清理资源
@@ -68,7 +68,7 @@ app = FastAPI(
     title="Deep Search API",
     description="知识库管理系统API",
     version="1.0.0",
-    #lifespan=lifespan
+    lifespan=lifespan
 )
 
 # 包含API路由
@@ -84,4 +84,4 @@ def read_root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

@@ -83,7 +83,7 @@ class UniversalRagService:
         db: Session,
         doc_id: str,
         *,
-        use_llm_for_pdf_no_toc: bool = False,
+        use_llm_for_pdf_no_toc: bool = True,
     ) -> Dict[str, Any]:
         """
         处理文档并写入 Elasticsearch。
@@ -305,27 +305,38 @@ class UniversalRagService:
         
 
         llm_token = 0
-
+        
         if use_llm_for_pdf_no_toc:
             # ── LLM 全流程（page_index 内部自动处理有无目录）──
-            reset_token_count()
-            json_path = await page_index(
-                file_path,
-                model="Qwen3-8B",
-                toc_check_page_num=10,
-                max_page_num_each_node=10,
-                max_token_num_each_node=10000,
-                if_add_node_id="yes",
-                if_add_node_summary="no",
-                if_add_node_text="yes",
-            )
-            token_count = get_token_count()
-            llm_token = token_count.get("input", 0) + token_count.get("output", 0)
-            return json_path, llm_token
+            try:
+                reset_token_count()
+                json_path = await page_index(
+                    file_path,
+                    model="Qwen3-8B",
+                    toc_check_page_num=10,
+                    max_page_num_each_node=10,
+                    max_token_num_each_node=10000,
+                    if_add_node_id="yes",
+                    if_add_node_summary="no",
+                    if_add_node_text="yes",
+                )
+                token_count = get_token_count()
+                llm_token = token_count.get("input", 0) + token_count.get("output", 0)
+                return json_path, llm_token
+            except Exception as exc:
+                logger.warning(f"LLM 全流程失败，降级为简单分块: {exc}")
+                # 降级为简单分块
+                print("LLM 全流程失败，降级为简单分块")
+                # 直接走简单分块
+                parser = PdfSimpleParser()
+                # 从 document.title 中提取文件名（不含扩展名）作为 doc_name
+                doc_name = os.path.splitext(document.title)[0]
+                result = parser.parse(file_path, doc_name=doc_name)
+                json_path = UniversalRagService._save_result_to_json(result, document.doc_id)
+                return json_path, 0
 
         # ── 快速模式：先检测 TOC，再决定是否走 LLM ──
         try:
-            
             print("开始检测 TOC")
             # 构建临时 opt 供 check_toc 使用
             opt = ConfigLoader().load({"model": "Qwen3-8B", "toc_check_page_num": 10})
@@ -336,28 +347,47 @@ class UniversalRagService:
             has_toc = bool(toc_result.get("toc_content")) and toc_result.get("page_index_given_in_toc") == 'yes'
         except Exception as exc:
             logger.warning(f"TOC 检测失败，降级为简单分块: {exc}")
-            has_toc = False
+            # 降级为简单分块
+            print("TOC 检测失败，降级为简单分块")
+            # 直接走简单分块
+            parser = PdfSimpleParser()
+            # 从 document.title 中提取文件名（不含扩展名）作为 doc_name
+            doc_name = os.path.splitext(document.title)[0]
+            result = parser.parse(file_path, doc_name=doc_name)
+            json_path = UniversalRagService._save_result_to_json(result, document.doc_id)
+            return json_path, 0
 
         if has_toc:
             print("检测到目录，走完整 page_index 流程")
             # 有目录 → 走完整 page_index 流程以获得精准结构
-            reset_token_count()
-            json_path = await page_index(
-                file_path,
-                model="Qwen3-8B",
-                toc_check_page_num=10,
-                max_page_num_each_node=10,
-                max_token_num_each_node=10000,
-                if_add_node_id="yes",
-                if_add_node_summary="no",
-                if_add_node_text="yes",
-            )
-            token_count = get_token_count()
-            llm_token = token_count.get("input", 0) + token_count.get("output", 0)
-            return json_path, llm_token
+            try:
+                reset_token_count()
+                json_path = await page_index(
+                    file_path,
+                    model="Qwen3-8B",
+                    toc_check_page_num=10,
+                    max_page_num_each_node=10,
+                    max_token_num_each_node=10000,
+                    if_add_node_id="yes",
+                    if_add_node_summary="no",
+                    if_add_node_text="yes",
+                )
+                token_count = get_token_count()
+                llm_token = token_count.get("input", 0) + token_count.get("output", 0)
+                return json_path, llm_token
+            except Exception as exc:
+                logger.warning(f"PageIndex 切块失败，降级为简单分块: {exc}")
+                # 降级为简单分块
+                print("PageIndex 切块失败，降级为简单分块")
+                # 直接走简单分块
+                parser = PdfSimpleParser()
+                # 从 document.title 中提取文件名（不含扩展名）作为 doc_name
+                doc_name = os.path.splitext(document.title)[0]
+                result = parser.parse(file_path, doc_name=doc_name)
+                json_path = UniversalRagService._save_result_to_json(result, document.doc_id)
+                return json_path, 0
 
         # 无目录 + 不用 LLM → 简单分块（快速、零 token）
-        print("无目录，按字符分块")
         parser = PdfSimpleParser()
         # 从 document.title 中提取文件名（不含扩展名）作为 doc_name
         doc_name = os.path.splitext(document.title)[0]

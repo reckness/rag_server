@@ -31,7 +31,7 @@ def count_tokens(text, model=None):
     # 简单的token计数近似
     return len(text.split())
 
-def calculate_token_size(payload, model_name="Qwen/Qwen3-8B"):
+def calculate_token_size(payload, model_name="Qwen3-8B"):
     """
     计算请求的token大小
     
@@ -44,17 +44,20 @@ def calculate_token_size(payload, model_name="Qwen/Qwen3-8B"):
     int: 请求token大小（备用方案）如果计算失败
     """
     try:
-        # 加载与模型匹配的 tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        # 只提取消息内容进行编码
+        # 直接使用备用方案，避免从 Hugging Face 下载模型
+        # 只提取消息内容进行简单计数
         messages = payload["messages"]
-        formatted_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        # 计算 token 数量
-        input_tokens = len(tokenizer.encode(formatted_text))
+        text = "".join([msg["content"] for msg in messages])
+        # 简单估算 token 数量（英文单词数 + 中文字符数）
+        import re
+        # 英文单词
+        english_words = len(re.findall(r'\b\w+\b', text))
+        # 中文字符
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
+        # 其他字符
+        other_chars = len(text) - len(re.findall(r'[\w\u4e00-\u9fa5]', text))
+        # 估算 token 数量（英文单词按1个token，中文字符按1个token，其他字符按2个算1个token）
+        input_tokens = english_words + chinese_chars + (other_chars // 2)
         return input_tokens
     except Exception as e:
         print(f"计算token时出错: {e}")
@@ -327,15 +330,19 @@ def count_tokens(text, model=None):
     if not text:
         return 0
     try:
-        # 尝试使用 tiktoken 计算 token 数量
-        if model and model.startswith('gpt'):
-            encoding = tiktoken.encoding_for_model(model)
-        else:
-            # 默认为 cl100k_base 编码
-            encoding = tiktoken.get_encoding('cl100k_base')
-        return len(encoding.encode(text))
+        # 直接使用简单估算方法，避免使用 tiktoken 库
+        # 简单估算 token 数量（英文单词数 + 中文字符数）
+        import re
+        # 英文单词
+        english_words = len(re.findall(r'\b\w+\b', text))
+        # 中文字符
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
+        # 其他字符
+        other_chars = len(text) - len(re.findall(r'[\w\u4e00-\u9fa5]', text))
+        # 估算 token 数量（英文单词按1个token，中文字符按1个token，其他字符按2个算1个token）
+        return english_words + chinese_chars + (other_chars // 2)
     except:
-        #  fallback: 简单估算
+        #  fallback: 最简单的估算
         return len(text) // 2
 
 def get_token_count():
