@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+venv/
+pdf/
+logs/
+pageindex/
+*.md
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+test.py
+show_result.py
+run_pdf.py

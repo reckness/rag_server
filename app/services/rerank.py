@@ -1,22 +1,56 @@
 import asyncio
+import httpx
+
+RERANK_URL = "http://10.1.141.33:8474/rerank"
 
 
 async def rerank(query, chunks, model=None):
-    """异步rerank"""
+    """异步rerank，通过远程 HTTP API 调用"""
     try:
-        if model is None:
-            # 模型加载失败时回退到按分数排序
+        if not chunks:
+            return chunks
+
+        documents = [c["embedding_text"] for c in chunks]
+
+        payload = {
+            "query": query,
+            "documents": documents,
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(RERANK_URL, json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+
+        # 解析返回结果，兼容多种 rerank API 格式
+        if "results" in result:
+            results_list = result["results"]
+            if results_list and "index" in results_list[0]:
+                # 格式1: {"results": [{"index": 0, "relevance_score": 0.9}, ...]}
+                for item in results_list:
+                    idx = item["index"]
+                    score = item.get("relevance_score", item.get("score", 0.0))
+                    chunks[idx]["rerank_score"] = float(score)
+            else:
+                # 格式2: {"results": [{"document": "...", "score": 8.69}, ...]}
+                # 结果按分数排序返回，通过 document 文本匹配回原始 chunks
+                doc_to_score = {}
+                for item in results_list:
+                    doc_text = item.get("document", "")
+                    score = item.get("relevance_score", item.get("score", 0.0))
+                    doc_to_score[doc_text] = float(score)
+                for c in chunks:
+                    c["rerank_score"] = doc_to_score.get(c["embedding_text"], 0.0)
+        elif "scores" in result:
+            # 格式3: {"scores": [0.9, 0.8, ...]}
+            for i, score in enumerate(result["scores"]):
+                chunks[i]["rerank_score"] = float(score)
+        else:
+            print(f"Rerank: 未识别的返回格式: {list(result.keys())}")
             chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
             return chunks
 
-        pairs = [(query, c["embedding_text"]) for c in chunks]
-
-        scores = await asyncio.to_thread(model.predict, pairs)
-
-        for i, c in enumerate(chunks):
-            c["rerank_score"] = float(scores[i])
-
-        chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+        chunks.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
 
         return chunks
     except Exception as e:

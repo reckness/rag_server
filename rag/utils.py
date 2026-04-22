@@ -5,6 +5,7 @@ import textwrap
 from datetime import datetime
 import time
 import json
+import re as _re
 import PyPDF2
 import copy
 import asyncio
@@ -12,6 +13,7 @@ import pymupdf
 from io import BytesIO
 from dotenv import load_dotenv
 from transformers import AutoTokenizer
+from json_repair import repair_json
 load_dotenv()
 import logging
 import yaml
@@ -98,12 +100,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             payload = {
                 "model": "Qwen3-8B",
                 "messages": messages,
+                "max_tokens": 4096,
                 "chat_template_kwargs": {
                     "enable_thinking": False
                 },
                 "temperature": 0
             }
-            print(f"\n===== 发送API请求 =====")
+            print(f"\n===== 发送API请求 =====\n")
             print(f"URL: {url}")
             print(f"头部: {headers}")
             try:
@@ -114,14 +117,14 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             input_tokens = calculate_token_size(payload)
             if not isinstance(input_tokens, Exception):
                 print(f"实际输入 token 数: {input_tokens}")
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response = requests.post(url, headers=headers, json=payload, timeout=300)
             print(f"响应状态码: {response.status_code}")
             print(f"响应头: {dict(response.headers)}")
             print(f"响应内容长度: {len(response.text)}")
             response.raise_for_status()
             data = response.json()
             content = data["choices"][0]["message"]["content"]
-            print(f"\n===== 模型回答 =====")
+            print(f"\n===== 模型回答 =====\n")
             # 限制输出长度为1000字
             if len(content) > 1000:
                 print(content[:1000] + "...")
@@ -217,6 +220,7 @@ async def llm_acompletion(model, prompt):
             payload = {
                 "model": "Qwen3-8B",
                 "messages": messages,
+                "max_tokens": 4096,
                 "chat_template_kwargs": {
                     "enable_thinking": False
                 },
@@ -234,7 +238,7 @@ async def llm_acompletion(model, prompt):
             input_tokens = calculate_token_size(payload)
             if not isinstance(input_tokens, Exception):
                 print(f"实际输入 token 数: {input_tokens}")
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response = requests.post(url, headers=headers, json=payload, timeout=300)
             print(f"响应状态码: {response.status_code}")
             print(f"响应头: {dict(response.headers)}")
             print(f"响应内容长度: {len(response.text)}")
@@ -360,45 +364,76 @@ def reset_token_count():
 
 def extract_json(content):
     """
-    从内容中提取并解析JSON
+    从内容中提取并解析JSON（策略六：多层后处理修复）
     
     参数:
     content: 包含JSON的内容
     
     返回:
-    dict: 解析后的JSON对象
+    dict/list: 解析后的JSON对象
     """
-    try:
-        # 首先，尝试提取包含在 ```json 和 ``` 之间的JSON
-        start_idx = content.find("```json")
-        if start_idx != -1:
-            start_idx += 7  # 调整索引，从分隔符后开始
-            end_idx = content.rfind("```")
+    if not content or not content.strip():
+        return {}
+
+    # Step 1: 提取 ```json ... ``` 代码块（如有）
+    start_idx = content.find("```json")
+    if start_idx != -1:
+        start_idx += 7
+        end_idx = content.rfind("```")
+        if end_idx > start_idx:
             json_content = content[start_idx:end_idx].strip()
         else:
-            # 如果没有分隔符，假设整个内容都是JSON
+            json_content = content[start_idx:].strip()
+    else:
+        # 尝试定位第一个 { 或 [ 到最后一个 } 或 ]
+        first_brace = -1
+        for i, c in enumerate(content):
+            if c in ('{', '['):
+                first_brace = i
+                break
+        if first_brace >= 0:
+            last_brace = max(content.rfind('}'), content.rfind(']'))
+            if last_brace > first_brace:
+                json_content = content[first_brace:last_brace + 1]
+            else:
+                json_content = content.strip()
+        else:
             json_content = content.strip()
 
-        # 清理可能导致解析错误的常见问题
-        json_content = json_content.replace('None', 'null')  # 将Python的None替换为JSON的null
-        json_content = json_content.replace('\n', ' ').replace('\r', ' ')  # 移除换行符
-        json_content = ' '.join(json_content.split())  # 标准化空白字符
+    # Step 2: 基础清理
+    json_content = json_content.replace('None', 'null')
+    json_content = json_content.replace('True', 'true').replace('False', 'false')
+    json_content = json_content.replace('\n', ' ').replace('\r', ' ')
+    json_content = ' '.join(json_content.split())
 
-        # 尝试解析并返回JSON对象
+    # Step 3: 直接解析
+    try:
         return json.loads(json_content)
-    except json.JSONDecodeError as e:
-        logging.error(f"提取JSON失败: {e}")
-        # 如果初始解析失败，尝试进一步清理内容
-        try:
-            # 移除括号/大括号前的尾随逗号
-            json_content = json_content.replace(',]', ']').replace(',}', '}')
-            return json.loads(json_content)
-        except:
-            logging.error("即使清理后也无法解析JSON")
-            return {}
+    except json.JSONDecodeError:
+        pass
+
+    # Step 4: 正则清理常见小模型错误
+    try:
+        cleaned = json_content
+        cleaned = cleaned.replace(',]', ']').replace(',}', '}')
+        cleaned = _re.sub(r',\s*]', ']', cleaned)
+        cleaned = _re.sub(r',\s*}', '}', cleaned)
+        cleaned = _re.sub(r'}\s*{', '},{', cleaned)
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Step 5: 使用 json_repair 库修复
+    try:
+        repaired = repair_json(json_content, return_objects=True)
+        if repaired is not None and repaired != '':
+            logging.info("json_repair 成功修复了 JSON")
+            return repaired
     except Exception as e:
-        logging.error(f"提取JSON时发生意外错误: {e}")
-        return {}
+        logging.warning(f"json_repair 修复失败: {e}")
+
+    logging.error(f"所有JSON解析方法均失败，原文前200字: {content[:200]}")
+    return {}
 
 def write_node_id(data, node_id=0):
     """
@@ -841,9 +876,107 @@ def add_preface_if_needed(data):
 
 
 
+def _detect_headers_footers(raw_page_texts, top_n=3, bottom_n=3, threshold=0.5):
+    """
+    检测PDF页眉页脚：在多页中重复出现的首尾行即为页眉/页脚。
+    
+    参数:
+    raw_page_texts: 每页原始文本列表
+    top_n: 检查每页前N行
+    bottom_n: 检查每页后N行
+    threshold: 出现比例超过此阈值视为页眉/页脚
+    
+    返回:
+    tuple: (header_lines, footer_lines) 被判定为页眉/页脚的文本集合
+    """
+    from collections import Counter
+    import re as _hf_re
+    num_pages = len(raw_page_texts)
+    if num_pages < 3:
+        return set(), set()
+
+    # 统计前top_n行的出现频率（按位置分别统计）
+    header_candidates = Counter()
+    footer_candidates = Counter()
+    for text in raw_page_texts:
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        for i, line in enumerate(lines[:top_n]):
+            # 对页眉第3行及以后，可能粘连正文，取前13字符做前缀匹配
+            if i >= 2 and len(line) > 15:
+                header_candidates[line[:13]] += 1
+            else:
+                header_candidates[line] += 1
+        for i, line in enumerate(lines[-bottom_n:]):
+            footer_candidates[line] += 1
+
+    min_count = int(num_pages * threshold)
+    header_lines = {text for text, count in header_candidates.items() if count >= min_count}
+    footer_lines = {text for text, count in footer_candidates.items() if count >= min_count}
+    # 排除过长的行（>30字符的重复行不太可能是页眉页脚，除非是前缀）
+    header_lines = {h for h in header_lines if len(h) <= 30}
+    footer_lines = {f for f in footer_lines if len(f) <= 30}
+    return header_lines, footer_lines
+
+
+def _remove_headers_footers(page_text, header_lines, footer_lines, top_n=3, bottom_n=3):
+    """
+    从单页文本中去除页眉页脚行。
+    
+    参数:
+    page_text: 单页文本
+    header_lines: 页眉文本集合
+    footer_lines: 页脚文本集合
+    top_n: 检查前N行
+    bottom_n: 检查后N行
+    
+    返回:
+    str: 去除页眉页脚后的文本
+    """
+    import re as _rm_re
+    lines = page_text.split('\n')
+    # 标记要移除的行索引
+    remove_indices = set()
+    
+    # 检查页眉（前top_n行）
+    non_empty_count = 0
+    for i, line in enumerate(lines):
+        if non_empty_count >= top_n:
+            break
+        stripped = line.strip()
+        if not stripped:
+            continue
+        non_empty_count += 1
+        # 精确匹配或前缀匹配
+        if stripped in header_lines:
+            remove_indices.add(i)
+        else:
+            # 前缀匹配：如果行的前13字符在header_lines中
+            prefix = stripped[:13] if len(stripped) > 15 else None
+            if prefix and prefix in header_lines:
+                # 页眉粘连正文：去掉页眉前缀部分，保留正文
+                lines[i] = stripped[len(prefix):].strip()
+                if not lines[i]:
+                    remove_indices.add(i)
+    
+    # 检查页脚（后bottom_n行）
+    non_empty_count = 0
+    for i in range(len(lines) - 1, -1, -1):
+        if non_empty_count >= bottom_n:
+            break
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        non_empty_count += 1
+        if stripped in footer_lines:
+            remove_indices.add(i)
+    
+    cleaned_lines = [lines[i] for i in range(len(lines)) if i not in remove_indices]
+    return '\n'.join(cleaned_lines)
+
+
 def get_page_tokens(pdf_path, model=None, pdf_parser="PyPDF2"):
     """
-    获取PDF文件每页的文本和token数量
+    获取PDF文件每页的文本和token数量，自动去除页眉页脚
     
     参数:
     pdf_path: PDF文件路径或BytesIO对象
@@ -853,35 +986,69 @@ def get_page_tokens(pdf_path, model=None, pdf_parser="PyPDF2"):
     返回:
     list: 每页的文本和token数量的列表
     """
+    # 第一步：提取所有页面原始文本
+    raw_texts = []
     if pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
-        page_list = []
         for page_num in range(len(pdf_reader.pages)):
             page = pdf_reader.pages[page_num]
-            page_text = page.extract_text()
-            token_length = len(page_text.split())
-            page_list.append((page_text, token_length))
-        return page_list
+            raw_texts.append(page.extract_text())
     elif pdf_parser == "PyMuPDF":
         if isinstance(pdf_path, BytesIO):
-            pdf_stream = pdf_path
-            doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
+            doc = pymupdf.open(stream=pdf_path, filetype="pdf")
         elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
             doc = pymupdf.open(pdf_path)
-        page_list = []
         for page in doc:
-            page_text = page.get_text()
-            token_length = len(page_text.split())
-            page_list.append((page_text, token_length))
-        return page_list
+            raw_texts.append(page.get_text())
     else:
         raise ValueError(f"不支持的PDF解析器: {pdf_parser}")
 
+    # 第二步：检测页眉页脚
+    header_lines, footer_lines = _detect_headers_footers(raw_texts)
+    
+    # 第三步：去除页眉页脚并构建结果
+    page_list = []
+    for page_text in raw_texts:
+        if header_lines or footer_lines:
+            page_text = _remove_headers_footers(page_text, header_lines, footer_lines)
+        token_length = len(page_text.split())
+        page_list.append((page_text, token_length))
+    return page_list
+
         
+
+def _merge_broken_lines(text):
+    """
+    合并PDF多栏排版产生的断行。
+    规则：如果一行以中文字符/字母/数字结尾（非标点），且下一行以非空白字符开头，
+    则认为是排版强制断行，将两行合并。
+    """
+    lines = text.split('\n')
+    if len(lines) <= 1:
+        return text
+    merged = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 检查是否需要与下一行合并
+        if i + 1 < len(lines) and line.strip():
+            stripped = line.rstrip()
+            next_line = lines[i + 1].strip()
+            # 当前行以中文/字母/数字结尾（非标点），且下一行非空
+            if (stripped and next_line and 
+                _re.search(r'[\u4e00-\u9fff\w]$', stripped) and
+                not _re.match(r'^[#=\-\*\|]', next_line)):
+                merged.append(stripped + next_line)
+                i += 2
+                continue
+        merged.append(line)
+        i += 1
+    return '\n'.join(merged)
+
 
 def get_text_of_pdf_pages(pdf_pages, start_page, end_page):
     """
-    获取PDF页面列表中指定页面范围的文本
+    获取PDF页面列表中指定页面范围的文本，自动合并排版断行
     
     参数:
     pdf_pages: PDF页面列表
@@ -894,7 +1061,7 @@ def get_text_of_pdf_pages(pdf_pages, start_page, end_page):
     text = ""
     for page_num in range(start_page-1, end_page):
         text += pdf_pages[page_num][0]
-    return text
+    return _merge_broken_lines(text)
 
 def get_text_of_pdf_pages_with_labels(pdf_pages, start_page, end_page):
     """
@@ -950,6 +1117,13 @@ def post_processing(structure, end_physical_index):
                 item['end_index'] = structure[i + 1]['physical_index']
         else:
             item['end_index'] = end_physical_index
+    
+    # 校验: 确保 start_index <= end_index，修正异常的页码范围
+    for item in structure:
+        if item.get('start_index') is not None and item.get('end_index') is not None:
+            if item['end_index'] < item['start_index']:
+                item['end_index'] = item['start_index']
+    
     tree = list_to_tree(structure)
     if len(tree)!=0:
         return tree
@@ -1129,6 +1303,7 @@ def convert_page_to_int(data):
 def add_node_text(node, pdf_pages):
     """
     为节点添加文本内容
+    对有子节点的节点，只分配其专属页面（子节点之前的页面），避免父子节点 text 重复。
     
     参数:
     node: 节点或节点列表
@@ -1137,9 +1312,20 @@ def add_node_text(node, pdf_pages):
     if isinstance(node, dict):
         start_page = node.get('start_index')
         end_page = node.get('end_index')
-        node['text'] = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
-        if 'nodes' in node:
+        if 'nodes' in node and node['nodes']:
+            # 父节点：只取自身 start_index 到第一个子节点 start_index 之前的页面
+            first_child_start = node['nodes'][0].get('start_index', end_page)
+            if first_child_start and first_child_start > start_page:
+                # 父节点有自己的专属页面（在第一个子节点之前）
+                parent_end = first_child_start - 1
+                node['text'] = get_text_of_pdf_pages(pdf_pages, start_page, parent_end)
+            else:
+                # 父子同页：父节点没有专属内容，text 留空避免重复
+                node['text'] = ""
             add_node_text(node['nodes'], pdf_pages)
+        else:
+            # 叶子节点：取完整页面范围
+            node['text'] = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
     elif isinstance(node, list):
         for index in range(len(node)):
             add_node_text(node[index], pdf_pages)
@@ -1177,9 +1363,13 @@ async def generate_node_summary(node, model=None):
     返回:
     str: 节点的摘要
     """
+    text = (node.get('text') or '').strip()
+    if not text:
+        return ""
+    
     prompt = f"""你获得了文档的一部分，你的任务是生成该部分文档的描述，说明该部分文档涵盖的主要内容。
 
-    部分文档文本: {node['text']}
+    部分文档文本: {text}
     
     直接返回描述，不要包含任何其他文本。
     """

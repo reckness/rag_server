@@ -126,8 +126,8 @@ class RagService:
                 chunks = await rerank(query, chunks, model)
                 # 过滤分数低于0.6的chunks
                 chunks = [chunk for chunk in chunks if chunk.get("rerank_score", 0) >= 0.6]
-            except ImportError as e:
-                # 处理缺少依赖的情况
+            except Exception as e:
+                # 处理rerank服务不可用的情况
                 print(f"Rerank not available: {e}")
                 # 回退到按分数排序
                 chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)

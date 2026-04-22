@@ -179,13 +179,21 @@ class ESConverter:
                 original_text = "\n".join(cleaned_lines)
             
             # 2. 计算 page_num_int 数组
-            # 优先使用输入 JSON 中的 start_index 和 end_index 字段
+            # 优先使用 start_index/end_index，其次 start_page/end_page，最后用顺序位置
             start_index = node.get("start_index")
-            end_index = node.get("end_index") + 1
-            # 生成 page_num_int 数组
-            page_num_int = list(range(start_index, end_index))
-            # 更新当前位置
-            self.current_position = end_index
+            end_index = node.get("end_index")
+            if start_index is not None and end_index is not None:
+                page_num_int = list(range(start_index, end_index + 1))
+                self.current_position = end_index + 1
+            else:
+                start_page = node.get("start_page")
+                end_page = node.get("end_page")
+                if start_page is not None and end_page is not None:
+                    page_num_int = list(range(start_page, end_page + 1))
+                    self.current_position = end_page + 1
+                else:
+                    page_num_int = [self.current_position]
+                    self.current_position += 1
             
             # 3. 处理 Node ID (优先用原有的，没有则生成)
             node_id = node.get("node_id", f"gen_id_{self.processed_count:05d}")

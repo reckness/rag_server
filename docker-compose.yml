@@ -1,28 +1,17 @@
 version: '3.8'
 
 services:
-  # 基础镜像构建服务
-  doc_parser_service_base:
-    build:
-      context: .
-      dockerfile: Dockerfile.base
-    image: doc_parser_service_base:1.0
-    container_name: doc_parser_service_base
-    command: "echo Base image built successfully"
-
-  # 主服务
-  doc_parser_service:
+  rag-service:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: doc_parser_service
+    image: rag-service:1.0
+    container_name: rag-service
     ports:
       - "8000:8000"
     volumes:
-      - .:/app
-      - ./models:/app/models:ro
+      - ./logs:/app/logs
       - ./pdf:/app/pdf
-      - ./rag/json:/app/rag/json
-    depends_on:
-      - doc_parser_service_base
+    environment:
+      - TZ=Asia/Shanghai
     restart: unless-stopped

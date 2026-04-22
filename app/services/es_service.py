@@ -19,36 +19,30 @@ class ESService:
         if fd_ids and not isinstance(fd_ids, list):
             fd_ids = [fd_ids]
         
+        # 构建 KNN filter（ES 8.x 中 filter 必须在 knn 块内才会对 KNN 结果生效）
+        knn_filters = [{"terms": {"kb_id": kb_ids}}]
+        if fd_ids:
+            knn_filters.append({"terms": {"folder": fd_ids}})
+
         body = {
             "size": topk,
-            "query": {
-                "bool": {
-                    "filter": []
-                }
-            },
             "knn": {
                 "field": "embedding",
                 "query_vector": query_vec,
                 "k": topk,
-                "num_candidates": 200  # 优化：增加候选数
+                "num_candidates": 200,
+                "filter": {"bool": {"must": knn_filters}}
             }
         }
-
-        # 处理kb_ids
-        body["query"]["bool"]["filter"].append({"terms": {"kb_id": kb_ids}})
-
-        # 处理fd_ids
-        if fd_ids:
-            # 对于多个fd_ids，使用多个wildcard查询
-            body["query"]["bool"]["filter"].append({"terms": {"folder": fd_ids}})
-          
 
         res = self.es.search(index="doc_summary_index", body=body)
 
         return [h["_source"]["doc_id"] for h in res["hits"]["hits"]]
 
     def retrieve_chunks(self, query, query_vec, doc_ids, topk=100):
-    
+        # KNN filter 确保只在指定文档中搜索
+        knn_filter = {"terms": {"doc_id": doc_ids}} if doc_ids else None
+
         body = {
             "size": topk,
             "query": {
@@ -70,13 +64,14 @@ class ESService:
                 "field": "embedding",
                 "query_vector": query_vec,
                 "k": topk,
-                "num_candidates": 200  # 优化：增加候选数
+                "num_candidates": 200,
             }
         }
 
-        # 处理doc_ids
+        # 处理doc_ids - 同时加到 query filter 和 knn filter
         if doc_ids:
             body["query"]["bool"]["must"].append({"terms": {"doc_id": doc_ids}})
+            body["knn"]["filter"] = {"terms": {"doc_id": doc_ids}}
 
         res = self.es.search(index=ELASTICSEARCH_INDEX, body=body)
 

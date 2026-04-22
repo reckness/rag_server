@@ -7,19 +7,13 @@ from app.core.database import engine, Base
 # 创建数据库表
 Base.metadata.create_all(bind=engine)
 
-# 加载模型函数
+# Rerank 配置（通过远程 HTTP API 调用）
+RERANK_API_URL = "http://10.1.141.33:8474/rerank"
+
 def load_model():
-    """加载模型"""
-    try:
-        from sentence_transformers import CrossEncoder
-        # 从本地加载模型
-        model = CrossEncoder("./models/bge-reranker-base")
-        print("模型加载成功")
-        return model
-    except ImportError as e:
-        # 处理缺少依赖的情况
-        print(f"Rerank not available: {e}")
-        return None
+    """初始化 rerank（远程 API 模式，无需加载本地模型）"""
+    print(f"Rerank API 地址: {RERANK_API_URL}")
+    return RERANK_API_URL
 
 # 处理上传的文档
 async def process_uploaded_documents():

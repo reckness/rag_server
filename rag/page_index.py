@@ -38,6 +38,128 @@ def set_logger(new_logger):
     logger = new_logger
 
 
+################### 规则判断函数（策略一：用代码替代简单判断类LLM调用） #######################
+def _rule_check_title_in_page(title, page_text):
+    """规则检测：标题是否出现在页面文本中（利用PDF内嵌文本的干净特性）"""
+    normalized_title = re.sub(r'\s+', '', title.strip().lower())
+    normalized_page = re.sub(r'\s+', '', page_text.strip().lower())
+    if not normalized_title:
+        return None
+    if normalized_title in normalized_page:
+        return 'yes'
+    title_len = len(normalized_title)
+    if title_len < 3:
+        return None
+    best_ratio = 0
+    for i in range(len(normalized_page) - title_len + 1):
+        window = normalized_page[i:i + title_len]
+        common = sum(1 for a, b in zip(normalized_title, window) if a == b)
+        ratio = common / title_len
+        if ratio > best_ratio:
+            best_ratio = ratio
+        if ratio >= 0.85:
+            return 'yes'
+    if best_ratio < 0.5:
+        return 'no'
+    return None
+
+
+def _rule_detect_toc_page(page_text):
+    """规则检测：该页是否为目录页"""
+    text = page_text.strip()
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return None
+    has_keyword = bool(re.search(r'table\s+of\s+contents|^contents$|目\s*录|目\s*次', text, re.MULTILINE | re.IGNORECASE))
+    dot_leader_count = len(re.findall(r'\.{3,}|…{2,}|(?:\. ){3,}', text))
+    lines_ending_with_number = sum(1 for l in lines if re.search(r'\d{1,4}\s*$', l))
+    if has_keyword and (dot_leader_count >= 2 or lines_ending_with_number >= 3):
+        return 'yes'
+    if dot_leader_count >= 5:
+        return 'yes'
+    if len(lines) > 5 and lines_ending_with_number / len(lines) > 0.5:
+        return 'yes'
+    if not has_keyword and dot_leader_count == 0 and lines_ending_with_number < 2:
+        return 'no'
+    return None
+
+
+def _rule_detect_page_index(toc_content):
+    """规则检测：目录中有没有页码"""
+    page_number_patterns = len(re.findall(r'[\.…:：]{2,}\s*\d+', toc_content))
+    line_ending_numbers = len(re.findall(r'\S+\s+\d{1,4}\s*$', toc_content, re.MULTILINE))
+    if page_number_patterns >= 3 or line_ending_numbers >= 3:
+        return 'yes'
+    if page_number_patterns == 0 and line_ending_numbers <= 1:
+        return 'no'
+    return None
+
+
+def _is_likely_heading(title):
+    """判断标题是否像真正的章节标题（而非正文片段）"""
+    t = title.strip()
+    if not t:
+        return False
+    # physical_index 标签误入
+    if '<physical_index' in t:
+        return False
+    # 过长的标题
+    if len(t) > 50:
+        return False
+    # 以标点/虚词结尾 → 正文片段
+    if re.search(r'[，。、；：！？的了着过呢吗得]$', t):
+        return False
+    # 全是标点或数字
+    if re.match(r'^[\d\s.、，。；：]+$', t):
+        return False
+    # 正向匹配：像真正的标题
+    # 1) 编号开头: "1.1 xxx", "第一章 xxx", "(一) xxx", "一、xxx"
+    if re.match(r'^[\d.]+\s', t):
+        return True
+    if re.match(r'^第[一二三四五六七八九十百千\d]+[章节部分篇]', t):
+        return True
+    if re.match(r'^[（(][一二三四五六七八九十\d]+[）)]', t):
+        return True
+    if re.match(r'^[一二三四五六七八九十]+[、.]', t):
+        return True
+    # 2) 短标题（≤12字且无明显正文特征）
+    if len(t) <= 12:
+        return True
+    # 3) 中长标题但包含关键词
+    if re.search(r'概述|总结|结论|引言|绪论|前言|摘要|附录|参考文献|发展|展望|分析|研究|方法|背景|目标|策略|规划|建设|驱动|价值|核心', t):
+        return True
+    return False
+
+
+def _filter_invalid_toc_entries(toc_items):
+    """后处理：过滤掉小模型生成的无效目录条目"""
+    # 先统计每页的条目数，如果某页条目过多，说明模型在逐行提取
+    from collections import Counter
+    page_counts = Counter()
+    for item in toc_items:
+        pi = item.get('physical_index')
+        if pi is not None:
+            page_counts[pi] += 1
+
+    filtered = []
+    for item in toc_items:
+        title = item.get('title', '')
+        pi = item.get('physical_index')
+        if not _is_likely_heading(title):
+            continue
+        # 如果某页条目 > 10，只保留有编号的标题
+        if pi is not None and page_counts.get(pi, 0) > 10:
+            t = title.strip()
+            is_numbered = bool(re.match(r'^[\d.]+\s', t)) or \
+                          bool(re.match(r'^第[一二三四五六七八九十百千\d]+', t)) or \
+                          bool(re.match(r'^[（(][一二三四五六七八九十\d]+[）)]', t)) or \
+                          bool(re.match(r'^[一二三四五六七八九十]+[、.]', t))
+            if not is_numbered:
+                continue
+        filtered.append(item)
+    return filtered
+
+
 ################### check title in page #########################################################
 async def check_title_appearance(item, page_list, start_index=1, model=None):    
     title=item['title']
@@ -48,6 +170,10 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
     page_number = item['physical_index']
     page_text = page_list[page_number-start_index][0]
 
+    # 策略一：先用规则判断
+    rule_result = _rule_check_title_in_page(title, page_text)
+    if rule_result is not None:
+        return {'list_index': item['list_index'], 'answer': rule_result, 'title': title, 'page_number': page_number}
     
     prompt = f"""
     你的任务是检查给定的章节是否在给定的页面文本中出现或开始。
@@ -133,6 +259,14 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
 
 
 def toc_detector_single_page(content, model=None):
+    # 策略一：先用规则判断
+    rule_result = _rule_detect_toc_page(content)
+    if rule_result is not None:
+        _logger = get_logger()
+        if _logger:
+            _logger.log("目录检测", f"规则判断结果: {rule_result}（跳过LLM调用）")
+        return rule_result
+
     prompt = f"""
     你的任务是检测给定文本中是否提供了目录。
 
@@ -148,9 +282,8 @@ def toc_detector_single_page(content, model=None):
     请注意：摘要、总结、符号列表、图表列表、表格列表等不是目录。"""
 
     response = llm_completion(model=model, prompt=prompt)
-    # print('response', response)
     json_content = extract_json(response)    
-    return json_content['toc_detected']
+    return json_content.get('toc_detected', 'no')
 
 
 def check_if_toc_extraction_is_complete(content, toc, model=None):
@@ -234,6 +367,13 @@ def detect_page_index(toc_content, model=None):
     logger = get_logger()
     if logger:
         logger.log("目录检查", "开始检测页面索引")
+    # 策略一：先用规则判断
+    rule_result = _rule_detect_page_index(toc_content)
+    if rule_result is not None:
+        if logger:
+            logger.log("目录检查", f"规则判断页码存在: {rule_result}（跳过LLM调用）")
+        return rule_result
+
     prompt = f"""
     你将获得一份目录。
 
@@ -250,7 +390,7 @@ def detect_page_index(toc_content, model=None):
 
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
-    return json_content['page_index_given_in_toc']
+    return json_content.get('page_index_given_in_toc', 'no')
 
 def toc_extractor(page_list, toc_page_list, model):
     def transform_dots_to_colon(text):
@@ -309,24 +449,25 @@ def toc_transformer(toc_content, model=None):
     logger = get_logger()
     if logger:
         logger.log("目录转换", "开始转换目录")
-    init_prompt = """
-    你获得了一份目录，你的任务是将整个目录转换为包含 table_of_contents 的 JSON 格式。
+    # 策略三：Few-Shot 示例引导小模型输出正确 JSON
+    init_prompt = """将下面的目录转为 JSON。
 
-    structure 是数字系统，表示目录中层级章节的索引。例如，第一节的结构索引为 1，第一个子节的结构索引为 1.1，第二个子节的结构索引为 1.2，依此类推。
+## 示例
 
-    响应应采用以下 JSON 格式：
-    {
-    table_of_contents: [
-        {
-            "structure": <structure index, "x.x.x" or None> (string),
-            "title": <title of the section>,
-            "page": <page number or None>,
-        },
-        ...
-        ],
-    }
-    你应该一次性转换完整的目录。
-    直接返回最终的 JSON 结构，不要输出任何其他内容。"""
+输入：
+第一章 绪论 : 1
+  1.1 研究背景 : 2
+  1.2 研究目的 : 5
+第二章 方法 : 8
+
+输出：
+{"table_of_contents": [{"structure": "1", "title": "第一章 绪论", "page": 1}, {"structure": "1.1", "title": "1.1 研究背景", "page": 2}, {"structure": "1.2", "title": "1.2 研究目的", "page": 5}, {"structure": "2", "title": "第二章 方法", "page": 8}]}
+
+## 规则
+- structure 用数字层级（1, 1.1, 1.2, 2...）
+- page 是页码数字，没有则填 null
+- 一次性转换完整目录
+- 只输出 JSON，不要输出任何其他内容"""
 
     prompt = init_prompt + '\n Given table of contents\n:' + toc_content
     last_complete, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
@@ -462,7 +603,7 @@ def add_page_offset_to_toc_json(data, offset):
 
 
 
-def page_list_to_group_text(page_contents, token_lengths, max_tokens=20000, overlap_page=1):    
+def page_list_to_group_text(page_contents, token_lengths, max_tokens=4000, overlap_page=1):    
     num_tokens = sum(token_lengths)
     
     if num_tokens <= max_tokens:
@@ -549,74 +690,89 @@ def generate_toc_continue(toc_content, part, model=None):
     logger = get_logger()
     if logger:
         logger.log("目录生成", "开始继续生成目录")
-    prompt = """
-    你是提取层次树结构的专家。
-    你获得了前一部分的树结构和当前部分的文本。
-    你的任务是从前一部分继续树结构，以包含当前部分。
+    # 策略五：只传最近5条结构作为上下文，避免上下文膨胀
+    recent_items = toc_content[-5:] if len(toc_content) > 5 else toc_content
+    # 策略三：Few-Shot 优化 prompt
+    prompt = """继续从文本中提取层次树结构，返回**仅新增部分**的 JSON 数组。
 
-    structure 变量是数字系统，表示目录中层级章节的索引。例如，第一节的结构索引为 1，第一个子节的结构索引为 1.1，第二个子节的结构索引为 1.2，依此类推。
+## 示例
 
-    对于标题，你需要从文本中提取原始标题，只修复空格不一致的问题。
+前一部分最后的结构：
+[{"structure": "1.2", "title": "1.2 研究目的", "physical_index": "<physical_index_3>"}]
 
-    提供的文本包含 <physical_index_X> 和 <physical_index_X> 这样的标签，用于指示页面 X 的开始和结束。
-    
-    对于 physical_index，你需要从文本中提取章节开始的物理索引。保持 <physical_index_X> 格式。
+当前文本：
+<physical_index_4>
+第二章 方法
+本章介绍研究方法...
+<physical_index_4>
 
-    响应应采用以下格式。
-        [
-            {
-                "structure": <structure index, "x.x.x"> (string),
-                "title": <title of the section, keep the original title>,
-                "physical_index": "<physical_index_X> (keep the format)"
-            },
-            ...
-        ]    
+输出：
+[{"structure": "2", "title": "第二章 方法", "physical_index": "<physical_index_4>"}]
 
-    直接返回最终 JSON 结构的附加部分。不要输出任何其他内容。"""
+## 规则
+- structure 从上一部分的编号继续
+- title 保留原始标题
+- physical_index 保持 <physical_index_X> 格式
+- 只输出新增章节的 JSON 数组，不要重复之前的内容"""
 
-    prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
+    prompt = prompt + '\nPrevious structure (last items):\n' + json.dumps(recent_items, ensure_ascii=False) + '\nGiven text:\n' + part
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+    result = extract_json(response)
+    if isinstance(result, list) and len(result) > 0:
+        return result
     if finish_reason == 'finished':
-        return extract_json(response)
+        return result if isinstance(result, list) else []
     else:
-        raise Exception(f'finish reason: {finish_reason}')
-    
+        if isinstance(result, list):
+            return result
+        logging.warning(f'generate_toc_continue finish_reason={finish_reason}, 返回空列表')
+        return []
+
 ### add verify completeness
 def generate_toc_init(part, model=None):
     logger = get_logger()
     if logger:
         logger.log("目录生成", "开始初始化生成目录")
-    prompt = """
-    你是提取层次树结构的专家，你的任务是生成文档的树结构。
+    # 策略三：Few-Shot 示例引导小模型
+    prompt = """从文本中提取层次树结构，返回 JSON 数组。
 
-    structure 变量是数字系统，表示目录中层级章节的索引。例如，第一节的结构索引为 1，第一个子节的结构索引为 1.1，第二个子节的结构索引为 1.2，依此类推。
+## 示例
 
-    对于标题，你需要从文本中提取原始标题，只修复空格不一致的问题。
+输入：
+<physical_index_1>
+第一章 绪论
+本章介绍研究背景...
+<physical_index_1>
 
-    提供的文本包含 <physical_index_X> 和 <physical_index_X> 这样的标签，用于指示页面 X 的开始和结束。
+<physical_index_2>
+1.1 研究背景
+近年来人工智能快速发展...
+第二章 方法
+<physical_index_2>
 
-    对于 physical_index，你需要从文本中提取章节开始的物理索引。保持 <physical_index_X> 格式。
+输出：
+[{"structure": "1", "title": "第一章 绪论", "physical_index": "<physical_index_1>"}, {"structure": "1.1", "title": "1.1 研究背景", "physical_index": "<physical_index_2>"}, {"structure": "2", "title": "第二章 方法", "physical_index": "<physical_index_2>"}]
 
-    响应应采用以下格式。
-        [
-            {{
-                "structure": <structure index, "x.x.x"> (string),
-                "title": <title of the section, keep the original title>,
-                "physical_index": "<physical_index_X> (keep the format)"
-            }},
-            
-        ],
-
-
-    直接返回最终的 JSON 结构。不要输出任何其他内容。"""
+## 规则
+- structure 用数字层级（1, 1.1, 1.2, 2...）
+- title 保留原始标题文字
+- physical_index 保持 <physical_index_X> 格式
+- 只输出 JSON 数组，不要输出任何其他内容"""
 
     prompt = prompt + '\nGiven text\n:' + part
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
 
+    result = extract_json(response)
+    if isinstance(result, list) and len(result) > 0:
+        return result
     if finish_reason == 'finished':
-         return extract_json(response)
+        return result if isinstance(result, list) else []
     else:
-        raise Exception(f'finish reason: {finish_reason}')
+        # max_output_reached: 尝试从截断的输出中提取已有的有效条目
+        if isinstance(result, list):
+            return result
+        logging.warning(f'generate_toc_init finish_reason={finish_reason}, 返回空列表')
+        return []
 
 def process_no_toc(page_list, start_index=1, model=None):
     logger = get_logger()
@@ -638,8 +794,10 @@ def process_no_toc(page_list, start_index=1, model=None):
         logger.log("目录处理", f"生成目录: {toc_with_page_number}")
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
+    # 后处理：过滤小模型产生的无效条目
+    toc_with_page_number = _filter_invalid_toc_entries(toc_with_page_number)
     if logger:
-        logger.log("目录处理", f"转换物理索引为整数: {toc_with_page_number}")
+        logger.log("目录处理", f"过滤后目录: {toc_with_page_number}")
 
     return toc_with_page_number
 
@@ -1067,7 +1225,7 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         logger.log("处理结果", f"错误结果: {incorrect_results}")
     if accuracy == 1.0 and len(incorrect_results) == 0:
         return toc_with_page_number
-    if accuracy > 0.6 and len(incorrect_results) > 0:
+    if accuracy > 0.3 and len(incorrect_results) > 0:
         toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results, start_index=start_index, max_attempts=3, model=opt.model)
         return toc_with_page_number
     else:
@@ -1081,6 +1239,16 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
  
 async def process_large_node_recursively(node, page_list, opt=None):
     logger = get_logger()
+    
+    # 如果节点已经有子节点（来自原始 TOC 解析），跳过重新生成，避免重复子树
+    if 'nodes' in node and node['nodes']:
+        tasks = [
+            process_large_node_recursively(child_node, page_list, opt)
+            for child_node in node['nodes']
+        ]
+        await asyncio.gather(*tasks)
+        return node
+    
     node_page_list = page_list[node['start_index']-1:node['end_index']]
     token_num = sum([page[1] for page in node_page_list])
     
@@ -1094,21 +1262,36 @@ async def process_large_node_recursively(node, page_list, opt=None):
         # Filter out items with None physical_index before post_processing
         valid_node_toc_items = [item for item in node_toc_tree if item.get('physical_index') is not None]
         
-        if valid_node_toc_items and node['title'].strip() == valid_node_toc_items[0]['title'].strip():
-            node['nodes'] = post_processing(valid_node_toc_items[1:], node['end_index'])
-            node['end_index'] = valid_node_toc_items[1]['start_index'] if len(valid_node_toc_items) > 1 else node['end_index']
+        if not valid_node_toc_items:
+            return node
+        
+        # 模糊匹配：如果第一个子项标题与父节点标题相同/包含，跳过它
+        if _titles_match(node['title'], valid_node_toc_items[0]['title']):
+            remaining = valid_node_toc_items[1:]
+            if remaining:
+                node['nodes'] = post_processing(remaining, node['end_index'])
+                node['end_index'] = remaining[0].get('start_index', node['end_index'])
         else:
             node['nodes'] = post_processing(valid_node_toc_items, node['end_index'])
-            node['end_index'] = valid_node_toc_items[0]['start_index'] if valid_node_toc_items else node['end_index']
+            node['end_index'] = valid_node_toc_items[0].get('start_index', node['end_index'])
         
-    if 'nodes' in node and node['nodes']:
-        tasks = [
-            process_large_node_recursively(child_node, page_list, opt)
-            for child_node in node['nodes']
-        ]
-        await asyncio.gather(*tasks)
+        # 递归处理新生成的子节点
+        if 'nodes' in node and node['nodes']:
+            tasks = [
+                process_large_node_recursively(child_node, page_list, opt)
+                for child_node in node['nodes']
+            ]
+            await asyncio.gather(*tasks)
     
     return node
+
+def _titles_match(title_a, title_b):
+    """模糊比较两个标题是否指同一章节（忽略空白，支持包含关系）"""
+    a = re.sub(r'\s+', '', (title_a or '').strip().lower())
+    b = re.sub(r'\s+', '', (title_b or '').strip().lower())
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
 
 async def tree_parser(page_list, opt, doc=None):
     check_toc_result = check_toc(page_list, opt)
@@ -1137,7 +1320,61 @@ async def tree_parser(page_list, opt, doc=None):
     # Filter out items with None physical_index before post_processings
     valid_toc_items = [item for item in toc_with_page_number if item.get('physical_index') is not None]
     
+    # 去重：移除标题和 physical_index 完全相同的重复条目
+    seen = set()
+    deduped_items = []
+    for item in valid_toc_items:
+        key = (item.get('title', '').strip(), item.get('physical_index'))
+        if key not in seen:
+            seen.add(key)
+            deduped_items.append(item)
+    valid_toc_items = deduped_items
+    
     toc_tree = post_processing(valid_toc_items, len(page_list))
+    
+    # 合并重叠的根节点：如果第一个根节点的页面范围涵盖了后续根节点，
+    # 将后续根节点合并为第一个根节点的子节点（修复 LLM 编号错误导致的重复子树）
+    def _get_max_end_index(node):
+        """递归获取节点及其所有后代的最大 end_index"""
+        max_end = node.get('end_index', 0)
+        for child in node.get('nodes', []):
+            child_max = _get_max_end_index(child)
+            if child_max > max_end:
+                max_end = child_max
+        return max_end
+    
+    if len(toc_tree) > 1:
+        first_root = toc_tree[0]
+        other_roots = list(toc_tree[1:])
+        total_merged = 0
+        
+        # 迭代合并：每轮合并后 max_end 可能增大，需重新检查剩余根节点
+        changed = True
+        while changed and other_roots:
+            changed = False
+            first_root_max_end = _get_max_end_index(first_root)
+            
+            new_remaining = []
+            for root_node in other_roots:
+                root_start = root_node.get('start_index', 0)
+                if root_start <= first_root_max_end + 1:
+                    if 'nodes' not in first_root:
+                        first_root['nodes'] = []
+                    first_root['nodes'].append(root_node)
+                    total_merged += 1
+                    changed = True
+                else:
+                    new_remaining.append(root_node)
+            other_roots = new_remaining
+            
+            if changed:
+                first_root['end_index'] = _get_max_end_index(first_root)
+        
+        if total_merged > 0:
+            toc_tree = [first_root] + other_roots
+            if logger:
+                logger.log("树合并", f"合并了 {total_merged} 个重叠根节点到第一个根节点下")
+    
     tasks = [
         process_large_node_recursively(node, page_list, opt)
         for node in toc_tree
@@ -1184,6 +1421,12 @@ async def page_index_main(doc, opt=None):
                 'doc_description': doc_description,
                 'structure': structure,
             }
+        else:
+            structure = format_structure(structure, order=['title', 'node_id', 'start_index', 'end_index', 'summary', 'text', 'nodes'])
+            result = {
+                'doc_name': get_pdf_name(doc),
+                'structure': structure,
+            }
     else:
         structure = format_structure(structure, order=['title', 'node_id', 'start_index', 'end_index', 'summary', 'text', 'nodes'])
         result = {
@@ -1194,7 +1437,7 @@ async def page_index_main(doc, opt=None):
     # 保存结构到临时文件
     import tempfile
     pdf_name = get_pdf_name(doc)
-    temp_dir = tempfile.gettempdir()
+    temp_dir = "./pdf/"
     json_save_path = os.path.join(temp_dir, f"{pdf_name}.json")
     
     with open(json_save_path, 'w', encoding='utf-8') as f:
