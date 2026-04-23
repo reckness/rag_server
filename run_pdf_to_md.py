@@ -20,10 +20,10 @@ from rag.utils import _detect_headers_footers, _remove_headers_footers
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("pdf", "辽宁省低空经济高质量发展路径研究.pdf")
 LLM_URL = "http://10.1.141.33:8001/v1/chat/completions"
-LLM_MODEL = "Qwen3-8B"
+LLM_MODEL = "qwen3.5-35b-int4"
 
 # md_to_tree 参数
-MODEL = "Qwen3-8B"
+MODEL = "qwen3.5-35b-int4"
 IF_THINNING = False
 THINNING_THRESHOLD = 5000
 SUMMARY_TOKEN_THRESHOLD = 200

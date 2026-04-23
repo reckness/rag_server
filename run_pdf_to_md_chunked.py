@@ -13,6 +13,8 @@ import json
 import re
 import requests
 import pymupdf
+import threading
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,10 +24,10 @@ from rag.utils import _detect_headers_footers, _remove_headers_footers
 
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("pdf", "珠三角电子信息产业集群创新网络演化及其机理研究_王炜.pdf")
-LLM_URL = "http://10.1.141.33:8001/v1/chat/completions"
-LLM_MODEL = "Qwen3-8B"
+LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
+LLM_MODEL = "qwen3.5-35b-int4"
 
-MODEL = "Qwen3-8B"
+MODEL = "qwen3.5-35b-int4"
 IF_THINNING = False
 THINNING_THRESHOLD = 5000
 SUMMARY_TOKEN_THRESHOLD = 200
@@ -34,7 +36,7 @@ IF_ADD_NODE_TEXT = True
 
 TOC_SCAN_PAGES = 15          # 扫描前 N 页寻找目录
 MAX_TOKENS_PER_CHUNK = 6000  # 每个分块最大字符数（安全阈值）
-CHUNK_TOKEN_THRESHOLD = 20000  # 章节 token 超过此阈值则按小节拆分
+CHUNK_TOKEN_THRESHOLD = 30000  # 章节 token 超过此阈值则按小节拆分
 
 
 # ==================== Step 1: 提取 PDF 页面文本 ====================
@@ -452,6 +454,7 @@ def chunk_text_to_markdown(chunk_title, chunk_text):
 5. 将跨页断开的段落合并为完整段落
 6. 不要添加原文中没有的内容
 7. 直接输出 Markdown，不要用代码块包裹，不要输出任何其他说明文字
+8. 原始文章的目录进行删除。对原文语言有偏差的内容可以进行删除
 
 PDF 提取文本：
 {chunk_text}
@@ -677,21 +680,63 @@ async def process_pdf_chunked(
 
     # Step 3.5: 对超大章节按子节拆分
     print("\n" + "=" * 60)
-    print("[Step 3.5] 检查章节 token 数，超过 20000 的按小节拆分")
+    print("[Step 3.5] 检查章节 token 数，超过 30000 的按小节拆分")
     print("=" * 60)
     chunks = refine_chunks_by_token(chunks, toc_entries, cleaned_pages)
 
-    # Step 4: 逐块处理（并行，最多 2 个 LLM 请求同时发送）
-    LLM_PARALLEL = 1
+    # Step 3.6: 丢弃参考文献/附录及其后的所有内容
+    _DISCARD_PATTERNS = re.compile(
+        r'^(参考文献|参考资料|references?|bibliography|附录|appendix|appendices)',
+        re.IGNORECASE
+    )
+    truncated_chunks = []
+    for chunk in chunks:
+        if _DISCARD_PATTERNS.search(chunk['title'].strip()):
+            print(f"\n[截断] 检测到 '{chunk['title']}'，丢弃该章节及后续所有内容")
+            break
+        truncated_chunks.append(chunk)
+    if len(truncated_chunks) < len(chunks):
+        print(f"  保留 {len(truncated_chunks)}/{len(chunks)} 个分块")
+    chunks = truncated_chunks
+
+    # Step 4: 逐块处理（动态并发，按字符容量池控制）
+    CHAR_CAPACITY = 1000000  # 全局字符容量池
     print("\n" + "=" * 60)
-    print(f"[Step 4] 逐块调用 LLM 生成 Markdown 并构建子树（并行={LLM_PARALLEL}）")
+    print(f"[Step 4] 逐块调用 LLM 生成 Markdown 并构建子树（字符容量池={CHAR_CAPACITY}）")
     print("=" * 60)
 
-    # 预处理：提取每个分块的文本，标记空块
+    # 预处理：提取每个分块的文本
     chunk_texts = []
     for i, chunk in enumerate(chunks):
         chunk_text = pages_to_chunk_text(cleaned_pages, chunk['start_page'], chunk['end_page'])
         chunk_texts.append(chunk_text)
+
+    # 动态并发控制：字符容量池
+    _cap_lock = threading.Lock()
+    _cap_cond = threading.Condition(_cap_lock)
+    _used_chars = [0]          # 当前占用的字符数
+    _peak_concurrent = [0]     # 峰值并发数
+    _running_count = [0]       # 当前并发任务数
+
+    def _acquire_capacity(char_count):
+        """获取字符容量，不足时阻塞等待"""
+        with _cap_cond:
+            while _used_chars[0] + char_count > CHAR_CAPACITY:
+                print(f"  [等待] 容量不足: 已用 {_used_chars[0]}/{CHAR_CAPACITY}, 需要 {char_count}")
+                _cap_cond.wait()
+            _used_chars[0] += char_count
+            _running_count[0] += 1
+            if _running_count[0] > _peak_concurrent[0]:
+                _peak_concurrent[0] = _running_count[0]
+            print(f"  [调度] 占用 {char_count} 字符, 当前已用 {_used_chars[0]}/{CHAR_CAPACITY}, 并发 {_running_count[0]}")
+
+    def _release_capacity(char_count):
+        """释放字符容量，通知等待线程"""
+        with _cap_cond:
+            _used_chars[0] -= char_count
+            _running_count[0] -= 1
+            print(f"  [释放] 归还 {char_count} 字符, 当前已用 {_used_chars[0]}/{CHAR_CAPACITY}, 并发 {_running_count[0]}")
+            _cap_cond.notify_all()
 
     def _process_one_chunk(idx):
         """处理单个分块：LLM 转 MD + 构建子树（在线程中执行）"""
@@ -705,18 +750,26 @@ async def process_pdf_chunked(
             print(f"  [跳过] 空分块")
             return idx, None, []
 
-        md_content = chunk_text_to_markdown(chunk['title'], chunk_text)
-        subtree = build_subtree_from_markdown(md_content)
-        print(f"  [完成] 分块 {idx+1} MD {len(md_content)} 字符, 子树 {len(subtree)} 个根节点")
-        return idx, md_content, subtree
+        # 获取容量（可能阻塞）
+        _acquire_capacity(char_count)
+        try:
+            md_content = chunk_text_to_markdown(chunk['title'], chunk_text)
+            subtree = build_subtree_from_markdown(md_content)
+            print(f"  [完成] 分块 {idx+1} MD {len(md_content)} 字符, 子树 {len(subtree)} 个根节点")
+            return idx, md_content, subtree
+        finally:
+            _release_capacity(char_count)
 
-    # 并行执行
-    results = [None] * len(chunks)  # (md_content, subtree)
-    with ThreadPoolExecutor(max_workers=LLM_PARALLEL) as executor:
+    # 并行执行（max_workers 设大，实际并发由容量池控制）
+    step4_start = _time.time()
+    results = [None] * len(chunks)
+    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
         futures = {executor.submit(_process_one_chunk, i): i for i in range(len(chunks))}
         for future in as_completed(futures):
             idx, md_content, subtree = future.result()
             results[idx] = (md_content, subtree)
+    step4_elapsed = _time.time() - step4_start
+    print(f"\n[Step 4 统计] LLM 总耗时: {step4_elapsed:.1f}s, 峰值并发: {_peak_concurrent[0]}")
 
     # 按原始顺序整理结果
     subtrees = []
@@ -738,17 +791,155 @@ async def process_pdf_chunked(
     print("[Step 5] 合并所有子树")
     print("=" * 60)
     merged_tree = merge_subtrees(chunks, subtrees, toc_entries)
+
+    # Step 5.5: 对叶子节点按段落进一步拆分
+    print("\n" + "=" * 60)
+    print("[Step 5.5] 对叶子节点按段落拆分")
+    print("=" * 60)
+
+    def split_leaf_by_paragraphs(nodes):
+        """递归处理：将叶子节点的 text 按段落拆分为子节点"""
+        split_count = 0
+        for node in nodes:
+            if node.get('nodes'):
+                # 非叶子节点，递归处理子节点
+                split_count += split_leaf_by_paragraphs(node['nodes'])
+                continue
+
+            text = (node.get('text') or '').strip()
+            if not text:
+                continue
+
+            # 按空行分段
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+            if len(paragraphs) <= 1:
+                continue
+
+            # 第一段可能包含标题行+正文（单换行连接），需分离
+            first_para = paragraphs[0]
+            header_match = re.match(r'^(#{1,6}\s+.+?)(?:\n(.+))?$', first_para, re.DOTALL)
+            if header_match:
+                header_line = header_match.group(1).strip()
+                body_after_header = (header_match.group(2) or '').strip()
+                # 标题行留在父节点
+                node['text'] = header_line
+                child_paragraphs = []
+                # 标题行后面紧跟的正文作为第一个段落子节点
+                if body_after_header:
+                    child_paragraphs.append(body_after_header)
+                child_paragraphs.extend(paragraphs[1:])
+            else:
+                # 没有标题行，所有段落都拆为子节点
+                node['text'] = ''
+                child_paragraphs = paragraphs
+
+            if not child_paragraphs:
+                continue
+
+            # 创建段落子节点
+            node['nodes'] = []
+            for j, para in enumerate(child_paragraphs, 1):
+                para_node = {
+                    'title': f"{node['title']} - 段落{j}",
+                    'text': para,
+                }
+                node['nodes'].append(para_node)
+            split_count += 1
+
+        return split_count
+
+    n_split = split_leaf_by_paragraphs(merged_tree)
+    print(f"  拆分了 {n_split} 个叶子节点")
+
     assign_node_ids(merged_tree)
 
-    # 可选：生成摘要
+    # 可选：生成摘要（并行，字符容量池控制）
     if if_summary:
-        print("\n[摘要] 正在为各节点生成摘要...")
+        from rag.utils import structure_to_list, count_tokens
+        SUMMARY_CHAR_CAPACITY = 45000
+
+        print(f"\n[摘要] 正在为各节点并行生成摘要（字符容量池={SUMMARY_CHAR_CAPACITY}）...")
         formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'summary', 'prefix_summary', 'text', 'nodes'])
-        formatted = await generate_summaries_for_structure_md(
-            formatted,
-            summary_token_threshold=summary_token_threshold,
-            model=model
-        )
+        all_nodes = structure_to_list(formatted)
+
+        # 筛选需要调用 LLM 生成摘要的节点（token 超过阈值且有文本）
+        def _get_summary_sync(node_text):
+            """同步调用 LLM 生成摘要"""
+            prompt = f"""你获得了文档的一部分，你的任务是生成该部分文档的描述，说明该部分文档涵盖的主要内容。
+
+    部分文档文本: {node_text}
+    
+    直接返回描述，不要包含任何其他文本。
+    """
+            return llm_call(prompt, max_tokens=4096)
+
+        # 构建任务列表：(index, node, text, char_count, need_llm)
+        summary_tasks = []
+        for i, node in enumerate(all_nodes):
+            node_text = (node.get('text') or '').strip()
+            if not node_text:
+                summary_tasks.append((i, node, node_text, 0, False))
+                continue
+            num_tokens = count_tokens(node_text, model=model)
+            need_llm = num_tokens >= summary_token_threshold
+            char_count = len(node_text)
+            summary_tasks.append((i, node, node_text, char_count, need_llm))
+
+        llm_tasks = [(i, node, text, cc) for i, node, text, cc, need in summary_tasks if need]
+        skip_tasks = [(i, node, text) for i, node, text, cc, need in summary_tasks if not need]
+        print(f"  共 {len(all_nodes)} 个节点, {len(llm_tasks)} 个需要 LLM 摘要, {len(skip_tasks)} 个直接使用原文")
+
+        # 直接赋值不需要 LLM 的节点
+        for i, node, text in skip_tasks:
+            if not node.get('nodes'):
+                node['summary'] = text
+            else:
+                node['prefix_summary'] = text
+
+        # 并行处理需要 LLM 的节点（字符容量池控制）
+        if llm_tasks:
+            _sum_lock = threading.Lock()
+            _sum_cond = threading.Condition(_sum_lock)
+            _sum_used = [0]
+            _sum_peak = [0]
+            _sum_running = [0]
+
+            def _acquire_sum_cap(cc):
+                with _sum_cond:
+                    while _sum_used[0] + cc > SUMMARY_CHAR_CAPACITY:
+                        _sum_cond.wait()
+                    _sum_used[0] += cc
+                    _sum_running[0] += 1
+                    if _sum_running[0] > _sum_peak[0]:
+                        _sum_peak[0] = _sum_running[0]
+
+            def _release_sum_cap(cc):
+                with _sum_cond:
+                    _sum_used[0] -= cc
+                    _sum_running[0] -= 1
+                    _sum_cond.notify_all()
+
+            def _summarize_one(task_tuple):
+                idx, node, text, cc = task_tuple
+                _acquire_sum_cap(cc)
+                try:
+                    summary = _get_summary_sync(text)
+                    return idx, node, summary
+                finally:
+                    _release_sum_cap(cc)
+
+            summary_start = _time.time()
+            with ThreadPoolExecutor(max_workers=len(llm_tasks)) as executor:
+                futures = {executor.submit(_summarize_one, t): t for t in llm_tasks}
+                for future in as_completed(futures):
+                    idx, node, summary = future.result()
+                    if not node.get('nodes'):
+                        node['summary'] = summary
+                    else:
+                        node['prefix_summary'] = summary
+            summary_elapsed = _time.time() - summary_start
+            print(f"  [摘要统计] 耗时: {summary_elapsed:.1f}s, 峰值并发: {_sum_peak[0]}")
+
         if not if_add_node_text:
             formatted = format_structure(formatted, order=['title', 'node_id', 'start_page', 'end_page', 'summary', 'prefix_summary', 'nodes'])
         merged_tree = formatted

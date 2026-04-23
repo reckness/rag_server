@@ -30,8 +30,8 @@ router = APIRouter()
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "pdf")
 BUCKET_NAME = "deepsearch"
-LLM_URL = "http://10.1.141.33:8001/v1/chat/completions"
-LLM_MODEL = "Qwen3-8B"
+LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
+LLM_MODEL = "qwen3.5-35b-int4"
 
 
 def get_db():
