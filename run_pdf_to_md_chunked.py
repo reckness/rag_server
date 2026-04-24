@@ -23,7 +23,7 @@ from rag.page_index_md import md_to_tree, extract_nodes_from_markdown, extract_n
 from rag.utils import _detect_headers_footers, _remove_headers_footers
 
 # ==================== 配置 ====================
-PDF_PATH = os.path.join("pdf", "珠三角电子信息产业集群创新网络演化及其机理研究_王炜.pdf")
+PDF_PATH = os.path.join("pdf", "2023中国人工智能系列白皮书--深度学习-中国人工智能学会.pdf")
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
 
@@ -36,7 +36,7 @@ IF_ADD_NODE_TEXT = True
 
 TOC_SCAN_PAGES = 15          # 扫描前 N 页寻找目录
 MAX_TOKENS_PER_CHUNK = 6000  # 每个分块最大字符数（安全阈值）
-CHUNK_TOKEN_THRESHOLD = 30000  # 章节 token 超过此阈值则按小节拆分
+CHUNK_TOKEN_THRESHOLD = 20000  # 章节 token 超过此阈值则按小节拆分
 
 
 # ==================== Step 1: 提取 PDF 页面文本 ====================
@@ -201,6 +201,17 @@ def detect_toc_from_text(cleaned_pages, scan_pages=15):
                 toc_page_indices.append(i)
                 continue
 
+            # 块状目录检测：标题行和页码行分离排布
+            # 统计纯数字行（页码候选）和非数字非空行（标题候选）
+            page_lines = text.split('\n')
+            num_only_lines = [l.strip() for l in page_lines if re.match(r'^\d{1,4}$', l.strip())]
+            title_like_lines = [l.strip() for l in page_lines
+                                if l.strip() and not re.match(r'^\d{1,4}$', l.strip())
+                                and len(l.strip()) >= 2]
+            if len(num_only_lines) >= 3 and len(title_like_lines) >= 3:
+                toc_page_indices.append(i)
+                continue
+
         # 即使没有"目录"关键词，如果页面中超过 5 行有"标题...数字"模式也算目录页
         dotted_lines = re.findall(r'.{2,}[\.…·]{3,}\s*\d+', text)
         if len(dotted_lines) >= 5:
@@ -277,14 +288,141 @@ def parse_toc_text(toc_text):
 
         i += 1
 
+    # 模式4: 块状目录——标题行和页码行分离排布
+    # 触发条件：条目不足，或已有条目的页码不是严格递增的（说明前面的模式匹配错误）
+    pages_monotonic = all(
+        entries[j]['page'] < entries[j+1]['page']
+        for j in range(len(entries)-1)
+    ) if len(entries) >= 2 else True
+    if len(entries) < 3 or not pages_monotonic:
+        raw_titles = []
+        pages = []
+        # 需要跳过的行（页眉页脚、目录关键词）
+        skip_patterns = re.compile(
+            r'^(目\s*录|contents|table\s+of\s+contents)$', re.IGNORECASE
+        )
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if re.match(r'^\d{1,4}$', line):
+                pages.append(int(line))
+            else:
+                if skip_patterns.match(line):
+                    continue
+                if len(line) >= 2:
+                    raw_titles.append(line)
+
+        # 合并 "第X章" 类编号行与副标题行
+        # 支持两种排列：
+        #   (A) 交替排列: 第一章, 研究与开发, 第二章, 技术性能, ...
+        #   (B) 分块排列: 第一章, 第二章, ..., 附录, 研究与开发, 技术性能, ...
+        chapter_pat = re.compile(r'^第[一二三四五六七八九十百\d]+[章节篇部]$')
+        standalone_pat = re.compile(r'^(附录|参考文献|致谢|前言|摘\s*要|Abstract|报告核心要点|获取公共数据)', re.IGNORECASE)
+
+        # 分离: 编号行、独立标题行、剩余行（潜在副标题）
+        chapter_lines = []  # ("第一章", index)
+        standalone_lines = []  # ("附录", index)
+        other_lines = []  # ("研究与开发", index)
+        for idx, t in enumerate(raw_titles):
+            if chapter_pat.match(t):
+                chapter_lines.append((t, idx))
+            elif standalone_pat.match(t):
+                standalone_lines.append((t, idx))
+            else:
+                other_lines.append((t, idx))
+
+        titles = []
+        if chapter_lines and len(other_lines) >= len(chapter_lines):
+            # 先尝试模式A（交替排列）：每个章节编号后面紧跟副标题
+            adjacent_pairs = True
+            for ch_text, ch_idx in chapter_lines:
+                # 检查 raw_titles 中下一个元素是否是非编号行
+                if ch_idx + 1 < len(raw_titles) and not chapter_pat.match(raw_titles[ch_idx + 1]):
+                    pass
+                else:
+                    adjacent_pairs = False
+                    break
+
+            if adjacent_pairs:
+                # 模式A：逐个合并
+                used = set()
+                for ch_text, ch_idx in chapter_lines:
+                    sub = raw_titles[ch_idx + 1]
+                    titles.append(f"{ch_text} {sub}")
+                    used.add(ch_idx)
+                    used.add(ch_idx + 1)
+                # 加入独立标题
+                for st_text, st_idx in standalone_lines:
+                    if st_idx not in used:
+                        titles.append(st_text)
+            else:
+                # 模式B（分块排列）：编号行在前，副标题行在后，一一配对
+                subtitles = [t for t, _ in other_lines[:len(chapter_lines)]]
+                remaining = [t for t, _ in other_lines[len(chapter_lines):]]
+
+                # 构建合并后的标题，并按原始位置排序
+                merged = []
+                for (ch_text, ch_idx), sub in zip(chapter_lines, subtitles):
+                    merged.append((ch_idx, f"{ch_text} {sub}"))
+                for st_text, st_idx in standalone_lines:
+                    merged.append((st_idx, st_text))
+                for rem_text in remaining:
+                    merged.append((999, rem_text))  # 放末尾
+                merged.sort(key=lambda x: x[0])
+                titles = [t for _, t in merged]
+        else:
+            # 没有章节编号，直接用 raw_titles（跳过常见页眉）
+            # 尝试简单的紧邻合并
+            i_t = 0
+            while i_t < len(raw_titles):
+                t = raw_titles[i_t]
+                if chapter_pat.match(t) and i_t + 1 < len(raw_titles):
+                    next_t = raw_titles[i_t + 1]
+                    if not chapter_pat.match(next_t) and not standalone_pat.match(next_t):
+                        titles.append(f"{t} {next_t}")
+                        i_t += 2
+                        continue
+                titles.append(t)
+                i_t += 1
+
+        # 找到最长递增页码子序列，长度应等于标题数
+        if len(titles) >= 3 and len(pages) >= 3:
+            def find_best_page_sequence(pg_list, n):
+                """从页码列表中找到长度为 n 的递增子序列"""
+                if len(pg_list) >= n:
+                    tail = pg_list[-n:]
+                    if all(tail[j] < tail[j+1] for j in range(len(tail)-1)):
+                        return tail
+                best = []
+                for s in range(len(pg_list)):
+                    seq = [pg_list[s]]
+                    for k in range(s+1, len(pg_list)):
+                        if pg_list[k] > seq[-1]:
+                            seq.append(pg_list[k])
+                    if len(seq) > len(best):
+                        best = seq
+                return best[:n] if len(best) >= n else best
+
+            matched_pages = find_best_page_sequence(pages, len(titles))
+            # 如果页码数不够，尝试截短 titles 以匹配
+            if len(matched_pages) < len(titles) and len(matched_pages) >= 3:
+                titles = titles[:len(matched_pages)]
+            if len(matched_pages) == len(titles):
+                entries = []
+                for title, page in zip(titles, matched_pages):
+                    level = _guess_toc_level(title)
+                    entries.append({'level': level, 'title': title, 'page': page})
+                print(f"[目录] 使用块状目录解析模式，匹配 {len(entries)} 个条目")
+
     return entries
 
 
 def _guess_toc_level(title):
     """根据标题格式猜测层级"""
     title = title.strip()
-    # "第X章" → level 1
-    if re.match(r'^第[一二三四五六七八九十\d]+章', title):
+    # "第X章"/"第X篇"/"第X部" → level 1
+    if re.match(r'^第[一二三四五六七八九十百\d]+[章篇部]', title):
         return 1
     # "第X节" → level 2
     if re.match(r'^第[一二三四五六七八九十\d]+节', title):
@@ -374,9 +512,28 @@ def refine_chunks_by_token(chunks, toc_entries, cleaned_pages, token_threshold=C
         ]
 
         if not sub_entries:
-            # 没有子节点，无法拆分，保持原样
-            print(f"  [拆分] {chunk['title']} ({estimated_tokens} tokens) 无子节可拆，保持原样")
-            refined.append(chunk)
+            # 没有子节点，按固定页数强制拆分
+            pages_per_sub = max(1, int(token_threshold * 1.5 / (len(chunk_text) / (chunk['end_page'] - chunk['start_page'] + 1))))
+            pages_per_sub = max(5, min(pages_per_sub, 15))  # 限制在5-15页
+            total_chunk_pages = chunk['end_page'] - chunk['start_page'] + 1
+            if total_chunk_pages <= pages_per_sub:
+                print(f"  [拆分] {chunk['title']} ({estimated_tokens} tokens) 无子节可拆，保持原样")
+                refined.append(chunk)
+                continue
+
+            n_subs = (total_chunk_pages + pages_per_sub - 1) // pages_per_sub
+            print(f"  [拆分] {chunk['title']} ({estimated_tokens} tokens) 无子节可拆，"
+                  f"按每 {pages_per_sub} 页强制拆为 {n_subs} 个子块")
+            for si in range(n_subs):
+                sub_start = chunk['start_page'] + si * pages_per_sub
+                sub_end = min(chunk['start_page'] + (si + 1) * pages_per_sub - 1, chunk['end_page'])
+                refined.append({
+                    'title': f"{chunk['title']} (第{si+1}部分)",
+                    'level': chunk['level'],
+                    'start_page': sub_start,
+                    'end_page': sub_end,
+                    '_parent_title': chunk['title'],
+                })
             continue
 
         print(f"  [拆分] {chunk['title']} ({estimated_tokens} tokens > {token_threshold})，"
@@ -425,8 +582,8 @@ def refine_chunks_by_token(chunks, toc_entries, cleaned_pages, token_threshold=C
 
 
 # ==================== Step 4: LLM 转 Markdown ====================
-def llm_call(prompt, max_tokens=8192):
-    """调用 LLM"""
+def llm_call(prompt, max_tokens=8192, retries=2):
+    """调用 LLM（含重试）"""
     headers = {"Content-Type": "application/json", "Authorization": "Bearer "}
     payload = {
         "model": LLM_MODEL,
@@ -435,9 +592,21 @@ def llm_call(prompt, max_tokens=8192):
         "chat_template_kwargs": {"enable_thinking": False},
         "temperature": 0
     }
-    resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=300)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=900)
+            if resp.status_code != 200:
+                print(f"  [LLM错误] status={resp.status_code}, prompt长度={len(prompt)}, "
+                      f"响应={resp.text[:500]}", flush=True)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < retries:
+                wait = 10 * (attempt + 1)
+                print(f"  [LLM重试] {type(e).__name__}, {wait}s 后重试 ({attempt+1}/{retries})", flush=True)
+                _time.sleep(wait)
+            else:
+                raise
 
 
 def chunk_text_to_markdown(chunk_title, chunk_text):
@@ -459,7 +628,12 @@ def chunk_text_to_markdown(chunk_title, chunk_text):
 PDF 提取文本：
 {chunk_text}
 """
-    md_content = llm_call(prompt)
+    # 动态调整 max_tokens，确保 prompt + max_tokens <= 模型上下文长度
+    prompt_tokens = int(len(prompt) / 1.5)
+    model_ctx = 32768
+    available = model_ctx - prompt_tokens - 100  # 留 100 token 余量
+    mt = max(2048, min(8192, available))
+    md_content = llm_call(prompt, max_tokens=mt)
     return md_content
 
 
@@ -666,8 +840,12 @@ async def process_pdf_chunked(
     print("[Step 2] 检测目录")
     print("=" * 60)
     toc_entries = detect_toc_from_bookmarks(pdf_path)
-    if not toc_entries:
-        toc_entries = detect_toc_from_text(cleaned_pages, scan_pages=toc_scan_pages)
+    if not toc_entries or len(toc_entries) < 3:
+        if toc_entries:
+            print(f"[目录] 书签目录仅 {len(toc_entries)} 个条目，尝试从文本中检测更完整的目录")
+        text_toc = detect_toc_from_text(cleaned_pages, scan_pages=toc_scan_pages)
+        if text_toc and len(text_toc) > len(toc_entries or []):
+            toc_entries = text_toc
 
     # Step 3: 分块
     print("\n" + "=" * 60)
@@ -722,7 +900,6 @@ async def process_pdf_chunked(
         """获取字符容量，不足时阻塞等待"""
         with _cap_cond:
             while _used_chars[0] + char_count > CHAR_CAPACITY:
-                print(f"  [等待] 容量不足: 已用 {_used_chars[0]}/{CHAR_CAPACITY}, 需要 {char_count}")
                 _cap_cond.wait()
             _used_chars[0] += char_count
             _running_count[0] += 1
@@ -853,51 +1030,54 @@ async def process_pdf_chunked(
 
     assign_node_ids(merged_tree)
 
-    # 可选：生成摘要（并行，字符容量池控制）
+    # 可选：生成摘要（只对每一章生成一个总结，不逐叶子节点总结）
     if if_summary:
-        from rag.utils import structure_to_list, count_tokens
+        from rag.utils import count_tokens
         SUMMARY_CHAR_CAPACITY = 45000
 
-        print(f"\n[摘要] 正在为各节点并行生成摘要（字符容量池={SUMMARY_CHAR_CAPACITY}）...")
+        print(f"\n[摘要] 正在为各章节并行生成摘要（字符容量池={SUMMARY_CHAR_CAPACITY}）...")
         formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'summary', 'prefix_summary', 'text', 'nodes'])
-        all_nodes = structure_to_list(formatted)
 
-        # 筛选需要调用 LLM 生成摘要的节点（token 超过阈值且有文本）
-        def _get_summary_sync(node_text):
-            """同步调用 LLM 生成摘要"""
-            prompt = f"""你获得了文档的一部分，你的任务是生成该部分文档的描述，说明该部分文档涵盖的主要内容。
+        def _collect_all_text(node):
+            """递归收集一个节点及其所有子节点的文本"""
+            parts = []
+            t = (node.get('text') or '').strip()
+            if t:
+                parts.append(t)
+            for child in (node.get('nodes') or []):
+                parts.extend(_collect_all_text(child))
+            return parts
 
-    部分文档文本: {node_text}
+        def _get_chapter_summary_sync(chapter_title, chapter_text):
+            """同步调用 LLM 为一章生成摘要"""
+            prompt = f"""你获得了文档某一章的内容，你的任务是生成该章的描述，说明该章涵盖的主要内容。
+
+    章节标题: {chapter_title}
+    章节文本: {chapter_text}
     
     直接返回描述，不要包含任何其他文本。
     """
             return llm_call(prompt, max_tokens=4096)
 
-        # 构建任务列表：(index, node, text, char_count, need_llm)
-        summary_tasks = []
-        for i, node in enumerate(all_nodes):
-            node_text = (node.get('text') or '').strip()
-            if not node_text:
-                summary_tasks.append((i, node, node_text, 0, False))
+        # 获取顶级章节节点（formatted 是列表）
+        top_chapters = formatted if isinstance(formatted, list) else [formatted]
+
+        # 构建章节级任务：每章收集全部文本后生成一个摘要
+        chapter_tasks = []  # (index, node, full_text, char_count)
+        for i, chapter in enumerate(top_chapters):
+            all_text_parts = _collect_all_text(chapter)
+            full_text = "\n".join(all_text_parts)
+            if not full_text.strip():
                 continue
-            num_tokens = count_tokens(node_text, model=model)
-            need_llm = num_tokens >= summary_token_threshold
-            char_count = len(node_text)
-            summary_tasks.append((i, node, node_text, char_count, need_llm))
+            # 截断过长文本以适应 LLM 上下文
+            if len(full_text) > 15000:
+                full_text = full_text[:15000]
+            chapter_tasks.append((i, chapter, full_text, len(full_text)))
 
-        llm_tasks = [(i, node, text, cc) for i, node, text, cc, need in summary_tasks if need]
-        skip_tasks = [(i, node, text) for i, node, text, cc, need in summary_tasks if not need]
-        print(f"  共 {len(all_nodes)} 个节点, {len(llm_tasks)} 个需要 LLM 摘要, {len(skip_tasks)} 个直接使用原文")
+        print(f"  共 {len(top_chapters)} 个顶级章节, {len(chapter_tasks)} 个需要生成摘要")
 
-        # 直接赋值不需要 LLM 的节点
-        for i, node, text in skip_tasks:
-            if not node.get('nodes'):
-                node['summary'] = text
-            else:
-                node['prefix_summary'] = text
-
-        # 并行处理需要 LLM 的节点（字符容量池控制）
-        if llm_tasks:
+        # 并行处理各章节摘要（字符容量池控制）
+        if chapter_tasks:
             _sum_lock = threading.Lock()
             _sum_cond = threading.Condition(_sum_lock)
             _sum_used = [0]
@@ -919,24 +1099,23 @@ async def process_pdf_chunked(
                     _sum_running[0] -= 1
                     _sum_cond.notify_all()
 
-            def _summarize_one(task_tuple):
-                idx, node, text, cc = task_tuple
+            def _summarize_chapter(task_tuple):
+                idx, chapter, text, cc = task_tuple
                 _acquire_sum_cap(cc)
                 try:
-                    summary = _get_summary_sync(text)
-                    return idx, node, summary
+                    title = chapter.get('title', '')
+                    summary = _get_chapter_summary_sync(title, text)
+                    return idx, chapter, summary
                 finally:
                     _release_sum_cap(cc)
 
             summary_start = _time.time()
-            with ThreadPoolExecutor(max_workers=len(llm_tasks)) as executor:
-                futures = {executor.submit(_summarize_one, t): t for t in llm_tasks}
+            with ThreadPoolExecutor(max_workers=len(chapter_tasks)) as executor:
+                futures = {executor.submit(_summarize_chapter, t): t for t in chapter_tasks}
                 for future in as_completed(futures):
-                    idx, node, summary = future.result()
-                    if not node.get('nodes'):
-                        node['summary'] = summary
-                    else:
-                        node['prefix_summary'] = summary
+                    idx, chapter, summary = future.result()
+                    # 摘要挂在顶级章节的 prefix_summary 上
+                    chapter['prefix_summary'] = summary
             summary_elapsed = _time.time() - summary_start
             print(f"  [摘要统计] 耗时: {summary_elapsed:.1f}s, 峰值并发: {_sum_peak[0]}")
 

@@ -1,4 +1,5 @@
 from typing import List, Dict, Any
+import math
 import asyncio
 from functools import lru_cache
 from .es_service import ESService
@@ -7,6 +8,11 @@ from .rerank import rerank
 from .folder_service import FolderService
 from common.doc_store.es_conn_pool import ES_CONN
 from common.config import ELASTICSEARCH_INDEX
+
+
+def sigmoid(x: float) -> float:
+    """Sigmoid 函数，将任意实数映射到 (0, 1)"""
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 class ScoreNormalizer:
@@ -110,32 +116,32 @@ class RagService:
         if not doc_ids:
             return {"chunks": [], "context": ""}
 
-        # 3️⃣ chunk召回（混合检索）
+        # 3️⃣ chunk召回（混合检索，RRF 倒数秩融合打分）
         chunks = self.es.retrieve_chunks(query, query_vec, doc_ids)
 
-        # 3.5️⃣ 分数归一化
-        normalizer = ScoreNormalizer(method='minmax')
-        chunks = normalizer.normalize(chunks)
+        # 3.5️⃣ 过滤低分 chunks（RRF 分数范围约 [0.01, 0.03]）
+        chunks = [chunk for chunk in chunks if chunk.get("_score", 0) >= 0.015]
 
-        # 3.6️⃣ 过滤分数低于0.6的chunks
-        chunks = [chunk for chunk in chunks if chunk.get("_score", 0) >= 0.6]
-
-        # 4️⃣ rerank（可选）
+        # 4️⃣ rerank + Sigmoid 映射最终 _score
         if req.use_rerank:
             try:
                 chunks = await rerank(query, chunks, model)
-                # 过滤分数低于0.6的chunks
-                chunks = [chunk for chunk in chunks if chunk.get("rerank_score", 0) >= 0.6]
+                # 用 rerank_score 通过 Sigmoid 映射到 [0,1] 作为最终 _score
+                for c in chunks:
+                    c["_score"] = sigmoid(c.get("rerank_score", 0))
+                chunks.sort(key=lambda x: x["_score"], reverse=True)
+                # 过滤 Sigmoid 映射后低于 0.5 的 chunks
+                chunks = [c for c in chunks if c["_score"] >= 0.5]
+                chunks = chunks[:10]
             except Exception as e:
-                # 处理rerank服务不可用的情况
                 print(f"Rerank not available: {e}")
-                # 回退到按分数排序
+                # 回退到 RRF 排序
                 chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
-                chunks = chunks[:10]  # 限制为10个
+                chunks = chunks[:10]
         else:
-            # 按分数排序
+            # 无 rerank，按 RRF 分数排序
             chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
-            chunks = chunks[:10]  # 限制为10个
+            chunks = chunks[:10]
 
         # 5️⃣ 上下文构建
         context = self._build_context(chunks, topk)
@@ -149,9 +155,14 @@ class RagService:
                     filtered_chunk[key] = value
             filtered_chunks.append(filtered_chunk)
 
+        # 只保留实际有 chunk 命中的 doc_id
+        hit_doc_ids = list(dict.fromkeys(
+            c.get("doc_id") for c in filtered_chunks if c.get("doc_id")
+        ))
+
         return {
             "query": query,
-            "doc_ids": doc_ids,
+            "doc_ids": hit_doc_ids,
             "chunks": filtered_chunks,
             "context": context
         }

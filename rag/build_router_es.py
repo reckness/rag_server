@@ -212,9 +212,33 @@ def mmr(sentences, topk=5, lambda_param=0.7):
 
 
 def build_summary(vector_json):
-    """构建摘要"""
+    """构建摘要：生成全面覆盖文档内容的 routing_text 用于文档路由"""
     chunks = normalize_chunks(vector_json)
 
+    # --- 1. 收集所有章节标题（去重保序） ---
+    seen_sections = set()
+    section_titles = []
+    for item in vector_json:
+        sp = item.get("section_path", [])
+        for title in sp:
+            title = title.strip()
+            if title and title not in seen_sections and len(title) >= 2:
+                seen_sections.add(title)
+                section_titles.append(title)
+
+    # --- 2. 收集每个顶级章节的首段文本（前200字） ---
+    seen_top_sections = set()
+    first_paragraphs = []
+    for item in vector_json:
+        sp = item.get("section_path", [])
+        top_section = sp[0] if sp else ""
+        if top_section and top_section not in seen_top_sections:
+            seen_top_sections.add(top_section)
+            text = item.get("embedding_text", "").strip()
+            if text and len(text) > 30:
+                first_paragraphs.append(text[:200])
+
+    # --- 3. TextRank + MMR 提取代表性句子 ---
     sentences = []
     for c in chunks:
         for s in split_sentences(c["text"]):
@@ -224,17 +248,28 @@ def build_summary(vector_json):
                 "section": c["section"]
             })
 
-    # TextRank
     sentences = textrank(sentences)
-
-    # MMR
     top_sentences = mmr(sentences, topk=6)
-
     summary = "。".join([s["sentence"] for s in top_sentences])
 
+    # --- 4. BM25 关键词 ---
     keywords = extract_keywords_bm25(chunks)
 
-    routing_text = summary + "\n关键词：" + ",".join(keywords)
+    # --- 5. 组合 routing_text：标题目录 + 章节首段 + 代表性句子 + 关键词 ---
+    parts = []
+    if section_titles:
+        parts.append("目录：" + "；".join(section_titles[:30]))
+    if first_paragraphs:
+        parts.append("各章节摘要：" + "。".join(first_paragraphs[:8]))
+    if summary:
+        parts.append("核心内容：" + summary)
+    if keywords:
+        parts.append("关键词：" + ",".join(keywords))
+
+    routing_text = "\n".join(parts)
+    # 截断到 embedding 模型安全长度
+    if len(routing_text) > 6000:
+        routing_text = routing_text[:6000]
 
     return {
         "summary": summary,
@@ -422,6 +457,15 @@ class DocumentRouter:
                 summary = self._generate_summary(data)
                 keywords = []
                 routing_text = summary
+
+            # 确保 routing_text 包含文档标题
+            if self.doc_title and self.doc_title not in (routing_text or ""):
+                routing_text = f"文档标题：{self.doc_title}\n{routing_text or ''}"
+
+            # routing_text 兜底：至少有标题
+            if not routing_text or len(routing_text.strip()) < 10:
+                routing_text = self.doc_title or "未知文档"
+                self.log(f"routing_text 过短，使用文档标题兜底", "WARN")
             
             # 提取主题（简单实现）
             topics = []

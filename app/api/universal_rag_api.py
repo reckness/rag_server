@@ -129,6 +129,46 @@ def get_supported_formats():
     )
 
 
+@router.get(
+    "/doc-json/{doc_id}",
+    response_model=ApiResponse[Dict[str, Any]],
+    summary="获取文档处理后的 JSON 结构",
+)
+def get_document_json(doc_id: str, db: Session = Depends(get_db)):
+    """
+    返回文档经过解析处理后生成的 JSON 树状结构。
+
+    该 JSON 包含文档的层级目录、各章节内容、摘要等信息。
+    """
+    document = DocumentRepository.get_by_id(db, doc_id)
+    if not document:
+        return ApiResponse.error(code=404, message="文档不存在")
+
+    if not document.pageindex_path:
+        return ApiResponse.error(code=404, message="文档尚未完成处理，无可用 JSON")
+
+    try:
+        minio_service = MinioService()
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        minio_service.download_file(BUCKET_NAME, document.pageindex_path, tmp_path)
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            doc_json = json.load(f)
+
+        os.unlink(tmp_path)
+
+        return ApiResponse.success(data={
+            "doc_id": doc_id,
+            "title": document.title,
+            "json": doc_json,
+        })
+    except Exception as e:
+        return ApiResponse.error(code=500, message=f"获取文档 JSON 失败: {str(e)}")
+
+
 # ---------------------------------------------------------------------------
 # 内部辅助：单个文档的「转 PDF → 解析 → 写入 ES」完整流程
 # ---------------------------------------------------------------------------
@@ -209,20 +249,26 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
 
         if estimated_tokens <= 8000:
             from run_pdf_to_md import process_pdf_simple
-            output = await process_pdf_simple(
-                pdf_path=temp_pdf_path,
-                output_dir=OUTPUT_DIR,
-                llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=False, if_add_node_text=True,
+            output = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: asyncio.run(process_pdf_simple(
+                    pdf_path=temp_pdf_path,
+                    output_dir=OUTPUT_DIR,
+                    llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
+                    if_summary=False, if_add_node_text=True,
+                ))
             )
             mode_used = "simple"
         else:
             from run_pdf_to_md_chunked import process_pdf_chunked
-            output = await process_pdf_chunked(
-                pdf_path=temp_pdf_path,
-                output_dir=OUTPUT_DIR,
-                llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=False, if_add_node_text=True,
+            output = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: asyncio.run(process_pdf_chunked(
+                    pdf_path=temp_pdf_path,
+                    output_dir=OUTPUT_DIR,
+                    llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
+                    if_summary=False, if_add_node_text=True,
+                ))
             )
             mode_used = "chunked"
 
@@ -247,7 +293,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
             doc_id=d_id, kb_id=k_id, fd_id=f_id,
             doc_title=document.title,
         )
-        converter.run()
+        await asyncio.to_thread(converter.run)
         chunk_num = len(converter.flat_nodes)
 
         DocumentRepository.update(db, doc_id, chunk_num=chunk_num)
@@ -260,7 +306,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
             doc_title=document.title,
             flat_nodes=converter.flat_nodes,
         )
-        doc_router.run()
+        await asyncio.to_thread(doc_router.run)
 
         await _notify(90.0, "文档路由生成完成")
 
