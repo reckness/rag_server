@@ -36,8 +36,7 @@ from rag.utils import get_page_tokens, ConfigLoader
 from rag.page_index import check_toc
 from rag.page_index import page_index
 from rag.utils import get_token_count, reset_token_count
-from rag.json_to_es_converter_with_embedding import ESConverter
-from common.config import ELASTICSEARCH_INDEX
+from rag.multi_index_writer import write_to_three_indices
 
 logger = logging.getLogger(__name__)
 
@@ -184,23 +183,18 @@ class UniversalRagService:
                 progress_msg="\n".join(processing_progress),
             )
 
-            # ── 4. ES 向量索引 ──────────────────────────────────────────
-           
-
-            converter = ESConverter(
-                page_index_output,
-                index_name=ELASTICSEARCH_INDEX,
+            # ── 4. 三级索引写入 (doc / chapter / chunk) ─────────────
+            chunk_num = write_to_three_indices(
+                json_path=page_index_output,
                 doc_id=str(document.doc_id),
                 kb_id=str(document.kb_id),
                 fd_id=str(document.fd_id),
                 doc_title=document.title,
             )
-            converter.run()
-            chunk_num = len(converter.flat_nodes)
 
-            progress = 75.0
+            progress = 90.0
             last_step_time = _add_progress(
-                processing_progress, last_step_time, "向量转换", "成功"
+                processing_progress, last_step_time, "三级索引写入", f"成功，{chunk_num} chunks"
             )
             DocumentRepository.update(
                 db,
@@ -208,30 +202,6 @@ class UniversalRagService:
                 progress=progress,
                 progress_msg="\n".join(processing_progress),
                 chunk_num=chunk_num,
-            )
-
-            # ── 5. 文档路由 ─────────────────────────────────────────────
-            from rag.build_router_es import DocumentRouter
-
-            router = DocumentRouter(
-                page_index_output,
-                doc_id=str(document.doc_id),
-                kb_id=str(document.kb_id),
-                fd_id=str(document.fd_id),
-                doc_title=document.title,
-                flat_nodes=converter.flat_nodes,
-            )
-            router.run()
-
-            progress = 90.0
-            last_step_time = _add_progress(
-                processing_progress, last_step_time, "文档路由生成", "成功"
-            )
-            DocumentRepository.update(
-                db,
-                document.doc_id,
-                progress=progress,
-                progress_msg="\n".join(processing_progress),
             )
 
             # ── 6. 完成 ─────────────────────────────────────────────────

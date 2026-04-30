@@ -84,7 +84,13 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
         # 3. 根据文档 token 数选择处理方式
         import fitz
         pdf_doc = fitz.open(temp_file_path)
-        full_text = "".join(page.get_text() for page in pdf_doc)
+        _page_texts = []
+        for _p in pdf_doc:
+            try:
+                _page_texts.append(_p.get_text())
+            except Exception:
+                _page_texts.append("")
+        full_text = "".join(_page_texts)
         pdf_doc.close()
         # 中文约 1.5 字符/token
         estimated_tokens = int(len(full_text) / 1.5)
@@ -98,7 +104,7 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
                 pdf_path=temp_file_path,
                 output_dir=OUTPUT_DIR,
                 llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=False, if_add_node_text=True,
+                if_summary=True, if_add_node_text=True,
             )
         else:
             from run_pdf_to_md_chunked import process_pdf_chunked
@@ -106,7 +112,7 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
                 pdf_path=temp_file_path,
                 output_dir=OUTPUT_DIR,
                 llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=False, if_add_node_text=True,
+                if_summary=True, if_add_node_text=True,
             )
         json_path = output["json_path"]
 

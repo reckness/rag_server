@@ -23,6 +23,43 @@ def is_supported(filename: str) -> bool:
     return ext in SUPPORTED_EXTENSIONS
 
 
+def _is_pdf_valid(pdf_path: str) -> bool:
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page_count = doc.page_count
+        doc.close()
+        return page_count > 0
+    except Exception:
+        return False
+
+
+def _run_libreoffice_convert(source_path: str, output_dir: str, target_format: str) -> subprocess.CompletedProcess:
+    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    profile_uri = f"file://{profile_dir}"
+    cmd = [
+        "libreoffice",
+        "--headless",
+        "--nologo",
+        "--nolockcheck",
+        "--nodefault",
+        "--nofirststartwizard",
+        f"-env:UserInstallation={profile_uri}",
+        "--convert-to", target_format,
+        "--outdir", output_dir,
+        source_path,
+    ]
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
 def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
     """
     将文件转换为 PDF。
@@ -47,20 +84,10 @@ def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 使用 LibreOffice headless 模式转换
-    cmd = [
-        "libreoffice",
-        "--headless",
-        "--convert-to", "pdf",
-        "--outdir", output_dir,
-        source_path,
-    ]
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=300,  # 5 分钟超时
+    result = _run_libreoffice_convert(
+        source_path=source_path,
+        output_dir=output_dir,
+        target_format="pdf:writer_pdf_Export",
     )
 
     if result.returncode != 0:
@@ -79,4 +106,33 @@ def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
-    return pdf_path
+    if _is_pdf_valid(pdf_path):
+        return pdf_path
+
+    if ext == ".doc":
+        fallback_dir = tempfile.mkdtemp(prefix="lo_doc_fallback_")
+        try:
+            docx_result = _run_libreoffice_convert(
+                source_path=source_path,
+                output_dir=fallback_dir,
+                target_format="docx",
+            )
+            fallback_docx_path = os.path.join(
+                fallback_dir,
+                f"{os.path.splitext(os.path.basename(source_path))[0]}.docx",
+            )
+            if docx_result.returncode == 0 and os.path.exists(fallback_docx_path):
+                retry_result = _run_libreoffice_convert(
+                    source_path=fallback_docx_path,
+                    output_dir=output_dir,
+                    target_format="pdf:writer_pdf_Export",
+                )
+                if retry_result.returncode == 0 and os.path.exists(pdf_path) and _is_pdf_valid(pdf_path):
+                    return pdf_path
+        finally:
+            shutil.rmtree(fallback_dir, ignore_errors=True)
+
+    raise RuntimeError(
+        f"生成的 PDF 异常（无法正常打开或页数为 0）: {pdf_path}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )

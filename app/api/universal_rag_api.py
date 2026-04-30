@@ -11,7 +11,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from common.config import ELASTICSEARCH_INDEX
@@ -23,8 +23,7 @@ from ..services.file_converter import convert_to_pdf, is_supported, SUPPORTED_EX
 from ..repository.document_repository import DocumentRepository
 from ..utils.response import ApiResponse
 from ..core.exceptions import NotFoundException, InternalServerErrorException
-from rag.json_to_es_converter_with_embedding import ESConverter
-from rag.build_router_es import DocumentRouter
+from rag.multi_index_writer import write_to_three_indices
 
 router = APIRouter()
 
@@ -32,6 +31,36 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.pat
 BUCKET_NAME = "deepsearch"
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
+
+
+def _find_json_nodes_by_id(nodes, target_id: str, id_fields, path=None):
+    path = path or []
+    matches = []
+    for node in nodes or []:
+        current_path = path + [{
+            "title": node.get("title", ""),
+            "node_id": node.get("node_id", ""),
+            "start_page": node.get("start_page"),
+            "end_page": node.get("end_page"),
+        }]
+        if any(str(node.get(field, "")) == str(target_id) for field in id_fields):
+            matches.append({
+                "path": current_path,
+                "node": node,
+            })
+        matches.extend(_find_json_nodes_by_id(
+            node.get("nodes") or [],
+            target_id,
+            id_fields,
+            current_path,
+        ))
+    return matches
+
+
+def _strip_children(node: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = dict(node)
+    cleaned.pop("nodes", None)
+    return cleaned
 
 
 def get_db():
@@ -134,7 +163,14 @@ def get_supported_formats():
     response_model=ApiResponse[Dict[str, Any]],
     summary="获取文档处理后的 JSON 结构",
 )
-def get_document_json(doc_id: str, db: Session = Depends(get_db)):
+def get_document_json(
+    doc_id: str,
+    chunk_id: Optional[str] = Query(default=None, description="按 chunk_id 精确返回对应 JSON 节点"),
+    node_id: Optional[str] = Query(default=None, description="按 node_id 精确返回对应 JSON 节点"),
+    chapter_id: Optional[str] = Query(default=None, description="按 chapter_id/node_id 返回对应章节 JSON 节点"),
+    include_children: bool = Query(default=True, description="返回节点时是否包含其子节点 nodes"),
+    db: Session = Depends(get_db),
+):
     """
     返回文档经过解析处理后生成的 JSON 树状结构。
 
@@ -160,6 +196,30 @@ def get_document_json(doc_id: str, db: Session = Depends(get_db)):
 
         os.unlink(tmp_path)
 
+        target_id = chunk_id or node_id or chapter_id
+        if target_id:
+            id_fields = ["node_id", "chunk_id", "title"] if chunk_id else ["node_id", "title"]
+            matches = _find_json_nodes_by_id(doc_json.get("structure", []), target_id, id_fields)
+            if not matches:
+                return ApiResponse.error(code=404, message=f"未找到对应 JSON 节点: {target_id}")
+
+            if not include_children:
+                for item in matches:
+                    item["node"] = _strip_children(item["node"])
+
+            return ApiResponse.success(data={
+                "doc_id": doc_id,
+                "title": document.title,
+                "query": {
+                    "chunk_id": chunk_id,
+                    "node_id": node_id,
+                    "chapter_id": chapter_id,
+                    "include_children": include_children,
+                },
+                "match_count": len(matches),
+                "matches": matches,
+            })
+
         return ApiResponse.success(data={
             "doc_id": doc_id,
             "title": document.title,
@@ -182,8 +242,6 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
 
     progress_callback: 可选的异步回调函数 async fn(percent, message)
     """
-    from common.doc_store.es_conn_pool import ES_CONN
-
     async def _notify(percent: float, msg: str):
         """更新 DB 进度 + 调用回调"""
         DocumentRepository.update(db, doc_id, progress=percent, progress_msg=msg)
@@ -242,7 +300,13 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         # --- 3. 根据 token 数选择解析方式（与 /pdf/process 逻辑一致）---
         import fitz
         pdf_doc = fitz.open(temp_pdf_path)
-        full_text = "".join(page.get_text() for page in pdf_doc)
+        _page_texts = []
+        for _p in pdf_doc:
+            try:
+                _page_texts.append(_p.get_text())
+            except Exception:
+                _page_texts.append("")
+        full_text = "".join(_page_texts)
         pdf_doc.close()
         estimated_tokens = int(len(full_text) / 1.5)
         await _notify(25.0, f"文档估算 {estimated_tokens} tokens，使用 {'simple' if estimated_tokens <= 8000 else 'chunked'} 模式")
@@ -255,7 +319,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
                     pdf_path=temp_pdf_path,
                     output_dir=OUTPUT_DIR,
                     llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                    if_summary=False, if_add_node_text=True,
+                    if_summary=True, if_add_node_text=True,
                 ))
             )
             mode_used = "simple"
@@ -267,7 +331,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
                     pdf_path=temp_pdf_path,
                     output_dir=OUTPUT_DIR,
                     llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                    if_summary=False, if_add_node_text=True,
+                    if_summary=True, if_add_node_text=True,
                 ))
             )
             mode_used = "chunked"
@@ -282,38 +346,20 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         DocumentRepository.update(db, doc_id, pageindex_path=json_object_name)
         await _notify(50.0, "文件解析完成，JSON 已上传")
 
-        # --- 4. ESConverter 写入 ES ---
+        # --- 4. 三级索引写入 (doc / chapter / chunk) ---
         d_id = str(document.doc_id)
         k_id = str(document.kb_id)
         f_id = str(document.fd_id)
 
-        converter = ESConverter(
-            json_path,
-            index_name=ELASTICSEARCH_INDEX,
+        chunk_num = await asyncio.to_thread(
+            write_to_three_indices,
+            json_path=json_path,
             doc_id=d_id, kb_id=k_id, fd_id=f_id,
             doc_title=document.title,
         )
-        await asyncio.to_thread(converter.run)
-        chunk_num = len(converter.flat_nodes)
 
         DocumentRepository.update(db, doc_id, chunk_num=chunk_num)
-        await _notify(75.0, f"向量转换完成，共 {chunk_num} 个 chunk")
-
-        # --- 5. DocumentRouter 写入文档路由 ---
-        doc_router = DocumentRouter(
-            json_path,
-            doc_id=d_id, kb_id=k_id, fd_id=f_id,
-            doc_title=document.title,
-            flat_nodes=converter.flat_nodes,
-        )
-        await asyncio.to_thread(doc_router.run)
-
-        await _notify(90.0, "文档路由生成完成")
-
-        # 刷新 ES 索引
-        es = ES_CONN.get_conn()
-        es.indices.refresh(index=ELASTICSEARCH_INDEX)
-        es.indices.refresh(index="doc_summary_index")
+        await _notify(90.0, f"三级索引写入完成，共 {chunk_num} 个 chunk")
 
         # --- 6. 完成 ---
         process_duration = (datetime.now() - process_begin_at).total_seconds()

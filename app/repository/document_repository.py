@@ -30,6 +30,19 @@ class DocumentRepository:
         if kb_id:
             query = query.filter(Document.kb_id == kb_id)
         return query.offset(skip).limit(limit).all()
+
+    @staticmethod
+    def get_by_folders(db: Session, fd_ids: List[str]) -> List[Document]:
+        return db.query(Document).filter(Document.fd_id.in_(fd_ids)).all()
+    
+    @staticmethod
+    def update_kb_id_by_folders(db: Session, fd_ids: List[str], new_kb_id: str) -> int:
+        updated = db.query(Document).filter(Document.fd_id.in_(fd_ids)).update(
+            {Document.kb_id: new_kb_id},
+            synchronize_session=False
+        )
+        db.commit()
+        return updated
     
     @staticmethod
     def get_by_status(db: Session, status: str, skip: int = 0, limit: int = 100) -> List[Document]:

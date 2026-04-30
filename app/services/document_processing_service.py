@@ -7,7 +7,10 @@ from datetime import datetime
 from ..repository.document_repository import DocumentRepository
 from ..repository.file_repository import FileRepository
 from ..services.minio_service import MinioService
-from ..core.exceptions import NotFoundException, InternalServerErrorException
+from ..services.doc_index_service import DocIndexService
+from ..services.chapter_index_service import ChapterIndexService
+from ..services.chunk_index_service import ChunkIndexService
+from ..core.exceptions import NotFoundException, InternalServerErrorException, BadRequestException
 from rag.page_index import page_index
 from rag.json_to_es_converter_with_embedding import ESConverter
 from rag.build_router_es import DocumentRouter
@@ -42,6 +45,95 @@ def add_progress_message(progress_list, last_step_time, step, result):
 
 
 class DocumentProcessingService:
+    @staticmethod
+    def delete_es_records_by_doc_id(doc_id: str) -> Dict[str, Any]:
+        """按 doc_id 删除 ES 中 doc/chapter/chunk 三类索引记录"""
+        try:
+            doc_deleted = DocIndexService().delete_by_doc_id(doc_id)
+            chapter_deleted = ChapterIndexService().delete_by_doc_id(doc_id)
+            chunk_deleted = ChunkIndexService().delete_by_doc_id(doc_id)
+        except Exception as e:
+            raise InternalServerErrorException(detail=f"删除 Elasticsearch 记录失败: {str(e)}")
+
+        if not (doc_deleted and chapter_deleted and chunk_deleted):
+            raise InternalServerErrorException(detail="部分索引删除失败，请检查服务日志")
+
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "deleted_indices": ["doc_index", "chapter_index", "chunk_index"],
+        }
+
+    @staticmethod
+    def update_kb_id_by_doc_id(db: Session, doc_id: str, new_kb_id: str) -> Dict[str, Any]:
+        """按 doc_id 将文件的 kb_id 更新为新的 kb_id（数据库 + ES）"""
+        if not new_kb_id:
+            raise BadRequestException(detail="new_kb_id 不能为空")
+
+        document = DocumentRepository.get_by_id(db, doc_id)
+        if not document:
+            raise NotFoundException(detail=f"ID为 {doc_id} 的文档不存在")
+
+        doc_updated = DocIndexService().update_kb_id_by_doc_id(doc_id, new_kb_id)
+        chapter_updated = ChapterIndexService().update_kb_id_by_doc_id(doc_id, new_kb_id)
+        chunk_updated = ChunkIndexService().update_kb_id_by_doc_id(doc_id, new_kb_id)
+
+        if doc_updated is None or chapter_updated is None or chunk_updated is None:
+            raise InternalServerErrorException(detail="更新 ES 的 kb_id 失败，请检查服务日志")
+
+        DocumentRepository.update(db, doc_id, kb_id=new_kb_id)
+
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "new_kb_id": new_kb_id,
+            "updated_counts": {
+                "doc_index": doc_updated,
+                "chapter_index": chapter_updated,
+                "chunk_index": chunk_updated,
+            }
+        }
+
+    @staticmethod
+    def update_kb_id_by_fd_ids(db: Session, fd_ids: list, new_kb_id: str) -> Dict[str, Any]:
+        """按多个 fd_id 批量将文件的 kb_id 更新为新的 kb_id（数据库 + ES）"""
+        if not new_kb_id:
+            raise BadRequestException(detail="new_kb_id 不能为空")
+        if not fd_ids:
+            raise BadRequestException(detail="fd_ids 不能为空")
+
+        fd_ids = [str(fd_id) for fd_id in fd_ids if fd_id not in (None, "")]
+        if not fd_ids:
+            raise BadRequestException(detail="fd_ids 不能为空")
+
+        documents = DocumentRepository.get_by_folders(db, fd_ids)
+        if not documents:
+            raise NotFoundException(detail=f"未找到 fd_id 属于 {fd_ids} 的文档")
+
+        doc_ids = [str(document.doc_id) for document in documents]
+        doc_updated = DocIndexService().update_kb_id_by_fd_ids(fd_ids, new_kb_id)
+        chapter_updated = ChapterIndexService().update_kb_id_by_fd_ids(fd_ids, new_kb_id)
+        chunk_updated = ChunkIndexService().update_kb_id_by_fd_ids(fd_ids, new_kb_id)
+
+        if doc_updated is None or chapter_updated is None or chunk_updated is None:
+            raise InternalServerErrorException(detail="更新 ES 的 kb_id 失败，请检查服务日志")
+
+        db_updated = DocumentRepository.update_kb_id_by_folders(db, fd_ids, new_kb_id)
+
+        return {
+            "success": True,
+            "fd_ids": fd_ids,
+            "new_kb_id": new_kb_id,
+            "updated_doc_count": db_updated,
+            "updated_doc_ids": doc_ids,
+            "updated_counts": {
+                "database": db_updated,
+                "doc_index": doc_updated,
+                "chapter_index": chapter_updated,
+                "chunk_index": chunk_updated,
+            },
+        }
+
     @staticmethod
     async def process_document(
         db: Session,

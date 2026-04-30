@@ -23,7 +23,7 @@ from rag.page_index_md import md_to_tree, extract_nodes_from_markdown, extract_n
 from rag.utils import _detect_headers_footers, _remove_headers_footers
 
 # ==================== 配置 ====================
-PDF_PATH = os.path.join("pdf", "2023中国人工智能系列白皮书--深度学习-中国人工智能学会.pdf")
+PDF_PATH = os.path.join("pdf", "珠三角电子信息产业集群创新网络演化及其机理研究_王炜.pdf")
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
 
@@ -38,6 +38,7 @@ TOC_SCAN_PAGES = 15          # 扫描前 N 页寻找目录
 MAX_TOKENS_PER_CHUNK = 6000  # 每个分块最大字符数（安全阈值）
 CHUNK_TOKEN_THRESHOLD = 20000  # 章节 token 超过此阈值则按小节拆分
 
+ENABLE_PDF_CLEANING = True   # 是否启用 PDF 文本清洗规则
 
 # ==================== Step 1: 提取 PDF 页面文本 ====================
 def _table_data_to_markdown(data):
@@ -123,12 +124,83 @@ def _extract_page_with_tables(page):
     return "\n\n".join(parts)
 
 
+def _normalize_pdf_whitespace(text):
+    text = text or ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = re.sub(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text
+
+
+def _remove_common_page_noise(text, page_num=None):
+    lines = text.split("\n")
+    if not lines:
+        return text
+
+    page_patterns = [
+        r"^\s*(?:第\s*)?\d{1,4}\s*(?:页)?\s*$",
+        r"^\s*[-–—]\s*\d{1,4}\s*[-–—]\s*$",
+        r"^\s*page\s+\d{1,4}(?:\s*/\s*\d{1,4})?\s*$",
+        r"^\s*\d{1,4}\s*/\s*\d{1,4}\s*$",
+    ]
+    if page_num is not None:
+        page_patterns.append(rf"^\s*(?:第\s*)?{page_num}\s*(?:页)?\s*$")
+
+    candidates = set(range(min(3, len(lines))))
+    candidates.update(range(max(0, len(lines) - 3), len(lines)))
+    cleaned = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if idx in candidates and any(re.match(pattern, stripped, re.IGNORECASE) for pattern in page_patterns):
+            continue
+        if re.match(r"^\s*(?:扫描全能王|CamScanner|版权所有|Copyright\s+©?)", stripped, re.IGNORECASE):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def _fix_pdf_line_breaks(text):
+    protected_lines = []
+    placeholders = {}
+    for idx, line in enumerate(text.split("\n")):
+        if line.lstrip().startswith("|"):
+            key = f"__TABLE_LINE_{idx}__"
+            placeholders[key] = line
+            protected_lines.append(key)
+        else:
+            protected_lines.append(line)
+
+    text = "\n".join(protected_lines)
+    text = re.sub(r"([A-Za-z])-\n([A-Za-z])", r"\1\2", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff，。；：、“”‘’（）《》])\n(?=[\u4e00-\u9fff（《“‘])", "", text)
+    text = re.sub(r"(?<=[A-Za-z0-9,;:])\n(?=[a-z(])", " ", text)
+    for key, line in placeholders.items():
+        text = text.replace(key, line)
+    return text
+
+
+def clean_pdf_page_text(text, page_num=None):
+    text = _normalize_pdf_whitespace(text)
+    text = _remove_common_page_noise(text, page_num)
+    text = _fix_pdf_line_breaks(text)
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def extract_all_pages(pdf_path):
     """提取 PDF 所有页面文本，表格自动转为 Markdown 表格格式，并去除页眉页脚"""
     doc = pymupdf.open(pdf_path)
 
     # 先用纯文本做页眉页脚检测
-    plain_texts = [page.get_text("text") for page in doc]
+    plain_texts = []
+    for page in doc:
+        try:
+            plain_texts.append(page.get_text("text"))
+        except Exception as e:
+            print(f"[提取] 警告: 第 {page.number + 1} 页无法提取文本: {e}")
+            plain_texts.append("")
     header_lines, footer_lines = _detect_headers_footers(plain_texts)
     if header_lines:
         print(f"[提取] 检测到页眉: {header_lines}")
@@ -139,22 +211,125 @@ def extract_all_pages(pdf_path):
     table_page_count = 0
     cleaned_pages = []
     for i, page in enumerate(doc):
-        tabs = page.find_tables()
-        has_tables = bool(tabs.tables)
+        try:
+            tabs = page.find_tables()
+            has_tables = bool(tabs.tables)
+        except Exception as e:
+            print(f"[提取] 警告: 第 {i + 1} 页表格检测失败: {e}")
+            has_tables = False
         if has_tables:
             table_page_count += 1
-            text = _extract_page_with_tables(page)
+            try:
+                text = _extract_page_with_tables(page)
+            except Exception as e:
+                print(f"[提取] 警告: 第 {i + 1} 页表格提取失败，回退到纯文本: {e}")
+                text = plain_texts[i]
         else:
             text = plain_texts[i]
 
         # 去除页眉页脚
         if header_lines or footer_lines:
             text = _remove_headers_footers(text, header_lines, footer_lines)
-        cleaned_pages.append(text.strip())
+        if ENABLE_PDF_CLEANING:
+            text = clean_pdf_page_text(text, i + 1)
+        cleaned_pages.append(text)
 
     doc.close()
     print(f"[提取] 共 {len(cleaned_pages)} 页，其中 {table_page_count} 页包含表格")
     return cleaned_pages
+
+
+def extract_page_text_blocks(pdf_path):
+    doc = pymupdf.open(pdf_path)
+    page_blocks = []
+    for page_idx, page in enumerate(doc, start=1):
+        blocks = []
+        try:
+            raw_blocks = page.get_text("blocks")
+        except Exception as e:
+            print(f"[提取] 警告: 第 {page_idx} 页无法提取文本块: {e}")
+            page_blocks.append(blocks)
+            continue
+        for block in raw_blocks:
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[:5]
+            text = (text or "").strip()
+            if not text:
+                continue
+            blocks.append({
+                "page_index": page_idx,
+                "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                "text": text,
+            })
+        page_blocks.append(blocks)
+    doc.close()
+    return page_blocks
+
+
+def _normalize_for_position_match(text):
+    return re.sub(r"\s+", "", re.sub(r"^#{1,6}\s*", "", text or ""))
+
+
+def _union_bbox(bboxes):
+    return [
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    ]
+
+
+def locate_text_positions(text, page_blocks, start_page=None, end_page=None):
+    target = _normalize_for_position_match(text)
+    if not target:
+        return []
+
+    locations = []
+    page_start = max(1, start_page or 1)
+    page_end = min(len(page_blocks), end_page or len(page_blocks))
+
+    for page_idx in range(page_start, page_end + 1):
+        blocks = page_blocks[page_idx - 1]
+        hit_bboxes = []
+        for block in blocks:
+            block_text = _normalize_for_position_match(block.get("text", ""))
+            if not block_text:
+                continue
+            if block_text in target or target in block_text:
+                hit_bboxes.append(block["bbox"])
+                continue
+            sample_len = min(len(target), 80)
+            if sample_len >= 20 and target[:sample_len] in block_text:
+                hit_bboxes.append(block["bbox"])
+                continue
+            if sample_len >= 20 and target[-sample_len:] in block_text:
+                hit_bboxes.append(block["bbox"])
+
+        if hit_bboxes:
+            locations.append({
+                "page_index": page_idx,
+                "bbox": _union_bbox(hit_bboxes),
+            })
+
+    return locations
+
+
+def annotate_leaf_locations(nodes, page_blocks, inherited_start=None, inherited_end=None):
+    for node in nodes:
+        start_page = node.get("start_page", inherited_start)
+        end_page = node.get("end_page", inherited_end)
+        if node.get("nodes"):
+            annotate_leaf_locations(node["nodes"], page_blocks, start_page, end_page)
+            continue
+
+        locations = locate_text_positions(node.get("text", ""), page_blocks, start_page, end_page)
+        if locations:
+            node["page_locations"] = locations
+            node["page_index"] = [loc["page_index"] for loc in locations]
+            node["bbox"] = locations[0]["bbox"] if len(locations) == 1 else [loc["bbox"] for loc in locations]
+            node["start_page"] = locations[0]["page_index"]
+            node["end_page"] = locations[-1]["page_index"]
 
 
 # ==================== Step 2: 检测目录 ====================
@@ -179,7 +354,7 @@ def detect_toc_from_bookmarks(pdf_path):
 
     if entries:
         print(f"[目录] 从 PDF 书签中提取到 {len(entries)} 个条目")
-    return entries if entries else None
+    return entries
 
 
 def detect_toc_from_text(cleaned_pages, scan_pages=15):
@@ -856,7 +1031,7 @@ async def process_pdf_chunked(
     else:
         chunks = split_by_page_count(cleaned_pages, pages_per_chunk=pages_per_chunk)
 
-    # Step 3.5: 对超大章节按子节拆分
+    # Step 3.5: 对超大章节按子节（level 2+）重新拆分
     print("\n" + "=" * 60)
     print("[Step 3.5] 检查章节 token 数，超过 30000 的按小节拆分")
     print("=" * 60)
@@ -1019,6 +1194,8 @@ async def process_pdf_chunked(
                 para_node = {
                     'title': f"{node['title']} - 段落{j}",
                     'text': para,
+                    'start_page': node.get('start_page'),
+                    'end_page': node.get('end_page'),
                 }
                 node['nodes'].append(para_node)
             split_count += 1
@@ -1030,13 +1207,16 @@ async def process_pdf_chunked(
 
     assign_node_ids(merged_tree)
 
+    page_blocks = extract_page_text_blocks(pdf_path)
+    annotate_leaf_locations(merged_tree, page_blocks)
+
     # 可选：生成摘要（只对每一章生成一个总结，不逐叶子节点总结）
     if if_summary:
         from rag.utils import count_tokens
         SUMMARY_CHAR_CAPACITY = 45000
 
         print(f"\n[摘要] 正在为各章节并行生成摘要（字符容量池={SUMMARY_CHAR_CAPACITY}）...")
-        formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'summary', 'prefix_summary', 'text', 'nodes'])
+        formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'bbox', 'page_locations', 'summary', 'prefix_summary', 'text', 'nodes'])
 
         def _collect_all_text(node):
             """递归收集一个节点及其所有子节点的文本"""
@@ -1120,7 +1300,7 @@ async def process_pdf_chunked(
             print(f"  [摘要统计] 耗时: {summary_elapsed:.1f}s, 峰值并发: {_sum_peak[0]}")
 
         if not if_add_node_text:
-            formatted = format_structure(formatted, order=['title', 'node_id', 'start_page', 'end_page', 'summary', 'prefix_summary', 'nodes'])
+            formatted = format_structure(formatted, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'bbox', 'page_locations', 'summary', 'prefix_summary', 'nodes'])
         merged_tree = formatted
 
     # Step 6: 保存结果

@@ -1,5 +1,10 @@
 from typing import List, Dict, Any
-from common.config import ELASTICSEARCH_INDEX
+from common.config import (
+    ELASTICSEARCH_INDEX,
+    ELASTICSEARCH_DOC_INDEX,
+    ELASTICSEARCH_CHAPTER_INDEX,
+    ELASTICSEARCH_CHUNK_INDEX,
+)
 from common.doc_store.es_conn_pool import ES_CONN
 
 
@@ -8,42 +13,64 @@ class ESService:
     def __init__(self):
         self.es = ES_CONN.get_conn()
 
-    def retrieve_docs(self, query_vec, kb_ids, fd_ids=None, topk=5):
-        # 验证参数
+    # ================================================================
+    # 第一重：doc_index 关键词召回（宽松，有就召回）
+    # ================================================================
+    def retrieve_docs(self, query, kb_ids, fd_ids=None, topk=50):
+        """BM25 关键词匹配 doc_index，宽松召回候选文档"""
         if not kb_ids:
             raise ValueError("kb_ids不能为空")
         if not isinstance(kb_ids, list):
             raise ValueError("kb_ids必须是列表")
-        if topk is None:
-            topk = 5
         if fd_ids and not isinstance(fd_ids, list):
             fd_ids = [fd_ids]
-        
-        # 构建 KNN filter（ES 8.x 中 filter 必须在 knn 块内才会对 KNN 结果生效）
-        knn_filters = [{"terms": {"kb_id": kb_ids}}]
+
+        must = [{"terms": {"kb_id": kb_ids}}]
         if fd_ids:
-            knn_filters.append({"terms": {"folder": fd_ids}})
+            must.append({"terms": {"fd_id": fd_ids}})
+
+        should = [
+            {"match": {"title": {"query": query, "boost": 2}}},
+            {"match": {"keywords": {"query": query}}},
+        ]
 
         body = {
             "size": topk,
-            "knn": {
-                "field": "embedding",
-                "query_vector": query_vec,
-                "k": topk,
-                "num_candidates": 200,
-                "filter": {"bool": {"must": knn_filters}}
-            }
+            "query": {
+                "bool": {
+                    "must": must,
+                    "should": should,
+                    "minimum_should_match": 0,
+                }
+            },
+            "_source": ["doc_id"],
         }
 
-        res = self.es.search(index="doc_summary_index", body=body)
+        res = self.es.search(index=ELASTICSEARCH_DOC_INDEX, body=body)
 
-        return [h["_source"]["doc_id"] for h in res["hits"]["hits"]]
+        seen = set()
+        doc_ids = []
+        for h in res["hits"]["hits"]:
+            did = h["_source"]["doc_id"]
+            if did not in seen:
+                seen.add(did)
+                doc_ids.append(did)
+        return doc_ids
 
-    def retrieve_chunks(self, query, query_vec, doc_ids, topk=100, rrf_k=60):
-        """混合检索：分别执行 KNN 和 BM25，使用 RRF（倒数秩融合）打分"""
-        doc_filter = {"terms": {"doc_id": doc_ids}} if doc_ids else None
+    # ================================================================
+    # 第二重：chapter_index 章节召回（KNN + BM25 RRF，阈值偏低）
+    # ================================================================
+    def retrieve_chapters(self, query, query_vec, doc_ids, kb_ids=None,
+                          topk=30, rrf_k=60, rrf_threshold=0.010):
+        """在候选 doc 的章节中做 KNN + BM25 RRF 融合召回"""
+        filters = []
+        if doc_ids:
+            filters.append({"terms": {"doc_id": doc_ids}})
+        if kb_ids:
+            filters.append({"terms": {"kb_id": kb_ids}})
+        chapter_filter = {"bool": {"must": filters}} if filters else None
 
-        # --- 1. KNN 向量检索 ---
+        # --- KNN ---
         knn_body = {
             "size": topk,
             "knn": {
@@ -52,48 +79,120 @@ class ESService:
                 "k": topk,
                 "num_candidates": 200,
             },
-            "_source": {"excludes": ["embedding"]}
+            "_source": ["doc_id", "chapter_id", "chapter_name"],
         }
-        if doc_filter:
-            knn_body["knn"]["filter"] = doc_filter
-        knn_res = self.es.search(index=ELASTICSEARCH_INDEX, body=knn_body)
+        if chapter_filter:
+            knn_body["knn"]["filter"] = chapter_filter
 
-        # --- 2. BM25 文本检索 ---
+        knn_res = self.es.search(index=ELASTICSEARCH_CHAPTER_INDEX, body=knn_body)
+
+        # --- BM25 ---
         bm25_body = {
             "size": topk,
             "query": {
                 "bool": {
-                    "must": [
-                        {"match": {"embedding_text": {"query": query}}}
-                    ]
+                    "must": [{"match": {"searchable_text": {"query": query}}}],
                 }
             },
-            "_source": {"excludes": ["embedding"]}
+            "_source": ["doc_id", "chapter_id", "chapter_name"],
         }
-        if doc_filter:
-            bm25_body["query"]["bool"]["filter"] = doc_filter
-        bm25_res = self.es.search(index=ELASTICSEARCH_INDEX, body=bm25_body)
+        if chapter_filter:
+            bm25_body["query"]["bool"]["filter"] = chapter_filter
 
-        # --- 3. RRF 倒数秩融合 ---
-        # RRF(d) = Σ 1 / (k + rank_i)，k 为平滑常数（默认60）
-        rrf_scores = {}   # doc_id -> rrf_score
-        doc_sources = {}  # doc_id -> _source
+        bm25_res = self.es.search(index=ELASTICSEARCH_CHAPTER_INDEX, body=bm25_body)
+
+        # --- RRF 融合 ---
+        rrf_scores: Dict[str, float] = {}
+        chapter_meta: Dict[str, Dict] = {}
 
         for rank, hit in enumerate(knn_res["hits"]["hits"], start=1):
-            doc_key = hit["_id"]
-            rrf_scores[doc_key] = rrf_scores.get(doc_key, 0) + 1.0 / (rrf_k + rank)
-            doc_sources[doc_key] = hit["_source"]
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            chapter_meta[key] = hit["_source"]
 
         for rank, hit in enumerate(bm25_res["hits"]["hits"], start=1):
-            doc_key = hit["_id"]
-            rrf_scores[doc_key] = rrf_scores.get(doc_key, 0) + 1.0 / (rrf_k + rank)
-            if doc_key not in doc_sources:
-                doc_sources[doc_key] = hit["_source"]
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            if key not in chapter_meta:
+                chapter_meta[key] = hit["_source"]
 
-        # --- 4. 按 RRF 分数排序 ---
+        # 过滤 + 排序
+        results = []
+        for key, score in rrf_scores.items():
+            if score >= rrf_threshold:
+                results.append({**chapter_meta[key], "_score": score})
+        results.sort(key=lambda x: x["_score"], reverse=True)
+
+        # 提取 chapter_ids
+        chapter_ids = [r["chapter_id"] for r in results]
+        return chapter_ids, results
+
+    # ================================================================
+    # 第三重：chunk_index 精细召回（KNN + BM25 RRF，正常阈值）
+    # ================================================================
+    def retrieve_chunks(self, query, query_vec, chapter_ids, kb_ids=None, doc_ids=None,
+                        topk=100, rrf_k=60, rrf_threshold=0.015):
+        """在候选章节中做 KNN + BM25 RRF 精细召回"""
+        filters = []
+        if chapter_ids:
+            filters.append({"terms": {"chapter_id": chapter_ids}})
+        if kb_ids:
+            filters.append({"terms": {"kb_id": kb_ids}})
+        if doc_ids:
+            filters.append({"terms": {"doc_id": doc_ids}})
+        chunk_filter = {"bool": {"must": filters}} if filters else None
+
+        # --- KNN ---
+        knn_body = {
+            "size": topk,
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_vec,
+                "k": topk,
+                "num_candidates": 200,
+            },
+            "_source": {"excludes": ["embedding"]},
+        }
+        if chunk_filter:
+            knn_body["knn"]["filter"] = chunk_filter
+
+        knn_res = self.es.search(index=ELASTICSEARCH_CHUNK_INDEX, body=knn_body)
+
+        # --- BM25 ---
+        bm25_body = {
+            "size": topk,
+            "query": {
+                "bool": {
+                    "must": [{"match": {"chunk_text": {"query": query}}}],
+                }
+            },
+            "_source": {"excludes": ["embedding"]},
+        }
+        if chunk_filter:
+            bm25_body["query"]["bool"]["filter"] = chunk_filter
+
+        bm25_res = self.es.search(index=ELASTICSEARCH_CHUNK_INDEX, body=bm25_body)
+
+        # --- RRF 融合 ---
+        rrf_scores: Dict[str, float] = {}
+        doc_sources: Dict[str, Dict] = {}
+
+        for rank, hit in enumerate(knn_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            doc_sources[key] = hit["_source"]
+
+        for rank, hit in enumerate(bm25_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            if key not in doc_sources:
+                doc_sources[key] = hit["_source"]
+
+        # 过滤 + 排序
         merged = []
-        for doc_key, score in rrf_scores.items():
-            merged.append({**doc_sources[doc_key], "_score": score})
-
+        for key, score in rrf_scores.items():
+            if score >= rrf_threshold:
+                merged.append({**doc_sources[key], "_score": score})
         merged.sort(key=lambda x: x["_score"], reverse=True)
+
         return merged[:topk]

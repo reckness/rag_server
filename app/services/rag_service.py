@@ -7,12 +7,23 @@ from .embedding import get_embedding
 from .rerank import rerank
 from .folder_service import FolderService
 from common.doc_store.es_conn_pool import ES_CONN
-from common.config import ELASTICSEARCH_INDEX
+from common.config import ELASTICSEARCH_INDEX, ELASTICSEARCH_CHUNK_INDEX
 
 
 def sigmoid(x: float) -> float:
     """Sigmoid 函数，将任意实数映射到 (0, 1)"""
     return 1.0 / (1.0 + math.exp(-x))
+
+
+def minmax_normalize_scores(scores: List[float], max_value: float = 0.90) -> List[float]:
+    """将分数列表归一化到 [0, max_value]。若分数相同，返回全 max_value。"""
+    if not scores:
+        return []
+    min_score = min(scores)
+    max_score = max(scores)
+    if max_score == min_score:
+        return [max_value] * len(scores)
+    return [((s - min_score) / (max_score - min_score)) * max_value for s in scores]
 
 
 class ScoreNormalizer:
@@ -110,28 +121,48 @@ class RagService:
         # 1️⃣ embedding
         query_vec = await get_embedding(query)
 
-        # 2️⃣ 文档路由（粗召回）
-        doc_ids = self.es.retrieve_docs(query_vec, kb_ids, fd_ids)
+        # 2️⃣ 第一重：doc_index 关键词召回（宽松，有就召回）
+        doc_ids = self.es.retrieve_docs(query, kb_ids, fd_ids)
 
         if not doc_ids:
             return {"chunks": [], "context": ""}
 
-        # 3️⃣ chunk召回（混合检索，RRF 倒数秩融合打分）
-        chunks = self.es.retrieve_chunks(query, query_vec, doc_ids)
+        # 3️⃣ 第二重：chapter_index 章节召回（KNN + BM25 RRF）
+        chapter_ids, chapter_results = self.es.retrieve_chapters(query, query_vec, doc_ids, kb_ids)
 
-        # 3.5️⃣ 过滤低分 chunks（RRF 分数范围约 [0.01, 0.03]）
-        chunks = [chunk for chunk in chunks if chunk.get("_score", 0) >= 0.015]
+        if not chapter_ids:
+            return {"chunks": [], "context": ""}
 
-        # 4️⃣ rerank + Sigmoid 映射最终 _score
+        # 4️⃣ 第三重：chunk_index 精细召回（KNN + BM25 RRF）
+        chunks = self.es.retrieve_chunks(query, query_vec, chapter_ids, kb_ids, doc_ids)
+
+        # 5️⃣ rerank + Sigmoid 映射最终 _score
         if req.use_rerank:
             try:
                 chunks = await rerank(query, chunks, model)
-                # 用 rerank_score 通过 Sigmoid 映射到 [0,1] 作为最终 _score
+
+                rerank_scores = []
                 for c in chunks:
-                    c["_score"] = sigmoid(c.get("rerank_score", 0))
-                chunks.sort(key=lambda x: x["_score"], reverse=True)
-                # 过滤 Sigmoid 映射后低于 0.5 的 chunks
-                chunks = [c for c in chunks if c["_score"] >= 0.5]
+                    s = c.get("rerank_score")
+                    if isinstance(s, (int, float)):
+                        rerank_scores.append(float(s))
+
+                # 只有存在有效 rerank_score 时才按 rerank 分数映射。
+                # 否则回退到 RRF 分数，避免所有结果被映射为 0.5。
+                if rerank_scores:
+                    normalized = minmax_normalize_scores(rerank_scores)
+                    idx = 0
+                    for c in chunks:
+                        s = c.get("rerank_score")
+                        if isinstance(s, (int, float)):
+                            c["_score"] = normalized[idx]
+                            idx += 1
+                        else:
+                            c["_score"] = 0.0
+                    chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
+                else:
+                    chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
+
                 chunks = chunks[:10]
             except Exception as e:
                 print(f"Rerank not available: {e}")
@@ -151,7 +182,7 @@ class RagService:
         for chunk in chunks[:topk]:
             filtered_chunk = {}
             for key, value in chunk.items():
-                if key not in ["embedding_text", "embedding"]:
+                if key not in ["embedding"]:
                     filtered_chunk[key] = value
             filtered_chunks.append(filtered_chunk)
 
@@ -174,12 +205,13 @@ class RagService:
         context_blocks = []
 
         for c in selected:
-            text = c.get("original_snippet", "")
-            section = " > ".join(c.get("section_path", []))
+            text = c.get("chunk_text", "")
+            chapter = c.get("chapter_title", "")
+            section = c.get("section_title", "")
 
             block = f"""
                 【文档】{c.get("doc_title")}
-                【章节】{section}
+                【章节】{chapter} > {section}
                 【内容】{text}
                 """
             context_blocks.append(block)
@@ -241,7 +273,7 @@ class RagService:
         body["query"]["bool"]["must"].append({"terms": {"page_num_int": expand_pages}})
 
         # 执行查询
-        res = self.es.es.search(index=ELASTICSEARCH_INDEX, body=body)
+        res = self.es.es.search(index=ELASTICSEARCH_CHUNK_INDEX, body=body)
 
         expanded_chunks = []
         for hit in res["hits"]["hits"]:

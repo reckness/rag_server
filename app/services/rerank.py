@@ -10,7 +10,13 @@ async def rerank(query, chunks, model=None):
         if not chunks:
             return chunks
 
-        documents = [c["embedding_text"] for c in chunks]
+        documents = [
+            c.get("embedding_text") or c.get("chunk_text") or ""
+            for c in chunks
+        ]
+        if not any(documents):
+            chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
+            return chunks
 
         payload = {
             "query": query,
@@ -40,7 +46,8 @@ async def rerank(query, chunks, model=None):
                     score = item.get("relevance_score", item.get("score", 0.0))
                     doc_to_score[doc_text] = float(score)
                 for c in chunks:
-                    c["rerank_score"] = doc_to_score.get(c["embedding_text"], 0.0)
+                    doc_text = c.get("embedding_text") or c.get("chunk_text") or ""
+                    c["rerank_score"] = doc_to_score.get(doc_text, 0.0)
         elif "scores" in result:
             # 格式3: {"scores": [0.9, 0.8, ...]}
             for i, score in enumerate(result["scores"]):

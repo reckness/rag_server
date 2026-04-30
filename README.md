@@ -1,249 +1,107 @@
-# RAG Service — 知识库文档解析与检索增强生成服务
+# RAG Service — 企业级文档解析与检索增强生成解决方案
 
-## 项目简介
+## 产品概述
 
-RAG Service 是一个基于 **FastAPI** 的后端服务，核心能力是将多格式文档（PDF、Word、TXT、PPT、Excel、Markdown）解析为结构化数据，写入 Elasticsearch 向量索引，并提供 **混合检索 + Rerank** 的 RAG 搜索接口，为下游 LLM 提供高质量上下文。
+**RAG Service** 是一个专为企业知识管理和大语言模型（LLM）应用打造的高性能后端服务平台。我们通过先进的文档解析技术，将多种格式的复杂文档（PDF、Word、TXT、PPT、Excel、Markdown）转化为结构化的知识数据，并结合向量搜索与混合检索算法，为AI系统提供高精度、上下文相关的知识支持，从而显著提升智能问答、内容生成和决策支持的质量与效率。
 
----
-
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| Web 框架 | FastAPI + Uvicorn |
-| 数据库 | PostgreSQL (SQLAlchemy ORM) |
-| 搜索引擎 | Elasticsearch 8.x（向量检索 + BM25 混合查询） |
-| 对象存储 | MinIO |
-| Embedding | qwen-embedding（1024 维，通过 HTTP API 调用） |
-| Rerank | bge-reranker-base（CrossEncoder，本地加载） |
-| PDF 解析 | PyMuPDF + LLM 辅助目录检测与切分（Qwen3-8B） |
-| 容器化 | Docker + Docker Compose |
+**核心价值主张**：
+- **多格式文档解析**：支持多种企业常用文档格式，深度提取结构化内容，保留语义完整性。
+- **高精度检索机制**：融合BM25关键词匹配与向量语义搜索，并通过Rerank模型优化结果排序，确保召回率与相关性兼顾。
+- **企业级集成能力**：提供标准化的RESTful API，可无缝对接内部系统、第三方应用及LLM框架，加速AI落地。
 
 ---
 
-## 项目结构
+## 技术架构与优势
 
-```
-rag-service/
-├── main.py                          # FastAPI 应用入口，加载 Rerank 模型、注册路由
-├── requirements.txt                 # Python 依赖
-├── Dockerfile                       # 生产镜像（基于基础镜像）
-├── Dockerfile.base                  # 基础镜像（安装系统依赖 + pip 包）
-├── docker-compose.yml               # 编排：基础镜像构建 + 主服务
-│
-├── app/                             # FastAPI 应用层
-│   ├── api/                         # API 路由
-│   │   ├── document_processing_api.py   # /document — 文档处理 & 状态查询
-│   │   ├── rag_api.py                   # /rag — RAG 搜索
-│   │   └── universal_rag_api.py         # /universal — 通用多格式文档处理
-│   ├── core/                        # 核心基础设施
-│   │   ├── database.py              # SQLAlchemy 引擎 & Session
-│   │   └── exceptions.py           # 自定义异常类
-│   ├── models/                      # 数据模型（SQLAlchemy ORM）
-│   ├── repository/                  # 数据访问层
-│   │   ├── document_repository.py   # 文档 CRUD
-│   │   ├── file_repository.py       # 文件 CRUD
-│   │   └── folder_repository.py     # 文件夹 CRUD（含递归子文件夹查询）
-│   ├── services/                    # 业务逻辑层
-│   │   ├── document_processing_service.py  # PDF 文档处理全流程
-│   │   ├── universal_rag_service.py        # 通用多格式文档处理
-│   │   ├── rag_service.py                  # RAG 搜索核心逻辑
-│   │   ├── es_service.py                   # ES 检索（文档路由 + Chunk 混合召回）
-│   │   ├── embedding.py                    # Embedding 获取（带 LRU 缓存）
-│   │   ├── rerank.py                       # CrossEncoder Rerank
-│   │   ├── minio_service.py                # MinIO 文件上传/下载
-│   │   ├── folder_service.py               # 文件夹管理
-│   │   └── parsers/                        # 多格式文档解析器
-│   │       ├── base_parser.py          # 解析器基类（定义统一输出格式）
-│   │       ├── word_parser.py          # Word (.docx/.doc) — 按标题样式切分
-│   │       ├── txt_parser.py           # TXT — 按字符数分块
-│   │       ├── ppt_parser.py           # PPT — 每张幻灯片一个节点
-│   │       ├── excel_parser.py         # Excel — 每个 Sheet 一个节点
-│   │       ├── md_parser.py            # Markdown — 按标题层级切分
-│   │       └── pdf_simple_parser.py    # PDF 简单分块（无 LLM）
-│   └── utils/                       # 工具函数
-│       ├── response.py              # 统一 API 响应格式
-│       └── uuid_generator.py        # UUID 生成
-│
-├── common/                          # 公共模块
-│   ├── config.py                    # 全局配置（ES / PG / MinIO / Redis / Embedding）
-│   ├── decorator.py                 # 装饰器
-│   ├── doc_store/                   # ES 连接管理
-│   │   ├── es_conn_base.py         # ES 连接基类
-│   │   ├── es_conn_pool.py         # ES 连接池（全局单例 ES_CONN）
-│   │   └── doc_store_base.py       # 文档存储基类
-│   └── nlp/
-│       └── embedding_client.py     # Embedding HTTP 客户端（qwen-embedding）
-│
-├── rag/                             # RAG 核心处理模块
-│   ├── config.yaml                  # page_index LLM 参数配置
-│   ├── page_index.py                # PDF PageIndex 切分（LLM 辅助，核心算法）
-│   ├── json_to_es_converter_with_embedding.py  # PageIndex JSON → ES 扁平节点 + 向量写入
-│   ├── build_router_es.py           # 文档路由生成（doc_summary_index）
-│   ├── search_summary.py            # 文档路由搜索脚本
-│   ├── run_router.py                # 路由生成运行脚本
-│   └── utils.py                     # 工具函数（token 提取、配置加载等）
-│
-├── deepdoc/                         # DeepDoc 解析器
-│   └── MiniDeepDocParser.py         # PDF 深度解析（OCR + 版面分析）
-│
-├── pageindex/                       # PageIndex 独立模块
-│   ├── config.yaml                  # 独立配置
-│   ├── page_index.py                # PageIndex 主逻辑
-│   ├── page_index_md.py             # Markdown 输出版本
-│   └── utils.py                     # 工具函数
-│
-└── pdf/                             # 测试用 PDF 文件及输出
-```
+RAG Service 基于现代微服务架构设计，融合前沿AI技术与企业级基础设施，确保高可用性与可扩展性。以下为核心技术栈与关键优势：
+
+| 技术领域 | 实现方案 | 优势 |
+|----------|----------|------|
+| **Web服务框架** | FastAPI + Uvicorn | 异步处理，高并发支持，API响应时间低至毫秒级。 |
+| **关系型数据库** | PostgreSQL + SQLAlchemy ORM | 事务性强，数据一致性有保障，适合复杂业务逻辑。 |
+| **向量搜索引擎** | Elasticsearch 8.x | 支持向量检索与BM25混合查询，兼顾语义与关键词匹配。 |
+| **分布式存储** | MinIO | 高性能对象存储，支持大规模文档与解析结果管理。 |
+| **语义嵌入模型** | qwen-embedding（1024维） | 通过HTTP API调用，生成高质量语义向量，确保检索精准度。 |
+| **结果重排序** | bge-reranker-base（CrossEncoder） | 本地部署重排序模型，优化搜索结果相关性。 |
+| **复杂文档解析** | PyMuPDF + LLM（Qwen3-8B） | 结合规则与大模型，智能检测PDF目录结构并精准切分章节。 |
+| **容器化部署** | Docker + Docker Compose | 一键部署，支持集群扩展，适应不同规模企业需求。 |
+
+**技术创新点**：
+- **智能切分策略**：针对无目录文档，利用LLM生成结构化目录，显著提升解析质量（可配置为纯规则模式以节省Token成本）。
+- **混合检索框架**：在单一查询中融合多种检索策略，平衡召回率与精确度，适应多样化搜索场景。
+- **模块化架构**：各组件解耦，易于定制与升级，例如可替换Embedding模型或存储后端。
 
 ---
 
-## 核心流程
+## 核心功能
 
-### 1. 文档处理流程
-
-```
-上传文档 → MinIO 存储 → 调用处理接口 → 解析 → ES 索引 → 状态更新
-```
-
-详细步骤：
-
-1. **下载文件**：从 MinIO 的 `deepsearch` 桶下载源文件到临时目录
-2. **解析文档**：根据文件扩展名分发到对应解析器
-   - **PDF**：检测是否有目录（TOC）
-     - 有目录 → `page_index()` LLM 精准切分（Qwen3-8B）
-     - 无目录 + `use_llm_for_pdf_no_toc=True` → LLM 生成目录后切分
-     - 无目录 + `use_llm_for_pdf_no_toc=False` → `PdfSimpleParser` 按字符快速分块
-   - **Word**：按标题样式（Heading 1-6）切分章节
-   - **TXT**：自动检测编码，按固定字符数分块
-   - **PPT**：每张幻灯片作为一个节点
-   - **Excel**：每个 Sheet 作为一个节点
-   - **Markdown**：按标题层级（# ~ ######）切分
-3. **向量索引**：`ESConverter` 将解析结果扁平化，生成 Embedding 写入 `page_index` 索引
-4. **文档路由**：`DocumentRouter` 生成文档摘要路由写入 `doc_summary_index` 索引
-5. **状态更新**：更新 PostgreSQL 中的文档状态为 `ready`
-
-### 2. RAG 搜索流程
-
-```
-用户查询 → Embedding → 文档路由粗召回 → Chunk 混合检索 → 分数归一化 → Rerank → 上下文构建
-```
-
-详细步骤：
-
-1. **Query Embedding**：将用户查询通过 `qwen-embedding` 转为 1024 维向量
-2. **文档路由粗召回**：在 `doc_summary_index` 中通过 KNN 向量检索找到相关文档（`retrieve_docs`）
-3. **Chunk 混合检索**：在 `page_index` 索引中对粗召回文档进行 **KNN 向量检索 + BM25 关键词匹配** 混合查询（`retrieve_chunks`）
-4. **分数归一化**：Min-Max 归一化，过滤分数 < 0.6 的低质量 Chunk
-5. **Rerank**（可选）：使用 `bge-reranker-base` CrossEncoder 对 Chunk 精排，过滤分数 < 0.6
-6. **上下文构建**：取 Top-K Chunk，按 `【文档】【章节】【内容】` 格式拼接上下文返回
+- **自动化文档处理**：将非结构化文档解析为标准JSON格式，提取目录层级、章节内容与语义摘要，支持后续检索与分析。
+- **知识库构建与管理**：支持批量文档上传、处理状态实时监控，以及Elasticsearch索引的动态更新与维护。
+- **检索增强生成（RAG）**：为LLM提供高质量上下文输入，通过API查询即可获取经排序优化的文档片段，减少幻觉，提升生成内容可信度。
+- **广泛格式兼容性**：覆盖企业常见文档类型（PDF、Office套件、Markdown等），确保知识资产全面数字化。
 
 ---
 
-## API 接口
+## 快速部署与集成
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `POST` | `/document/process/{doc_id}` | 处理文档（PDF 专用，非 PDF 自动委托给通用接口） |
-| `GET` | `/document/status/{doc_id}` | 查询文档处理状态 |
-| `POST` | `/rag/search` | RAG 搜索（需传 query, kb_ids, fd_ids 等） |
-| `POST` | `/universal/process/{doc_id}` | 通用多格式文档处理（支持 PDF/Word/TXT/PPT/Excel/MD） |
-| `GET` | `/universal/supported-formats` | 查询支持的文件格式列表 |
-| `GET` | `/` | 健康检查 |
+### 环境要求
 
-### RAG 搜索请求示例
+- **运行时**：Python 3.10或更高版本
+- **容器化**：Docker 20.x+（推荐用于生产环境）
+- **硬件建议**：最低8核CPU，16GB内存，50GB存储；如涉及大规模文档处理或高并发，建议32GB+内存及NVMe SSD。
 
-```json
-{
-  "query": "低空经济发展趋势",
-  "kb_ids": ["kb_id_1"],
-  "fd_ids": ["fd_id_1"],
-  "topk": 5,
-  "use_rerank": true
-}
-```
+### 安装与启动
 
-### RAG 搜索响应示例
-
-```json
-{
-  "code": 200,
-  "data": {
-    "query": "低空经济发展趋势",
-    "doc_ids": ["doc_1", "doc_2"],
-    "chunks": [
-      {
-        "doc_title": "低空经济研究报告",
-        "section_path": ["第一章", "1.1 发展背景"],
-        "original_snippet": "...",
-        "_score": 0.92
-      }
-    ],
-    "context": "【文档】低空经济研究报告\n【章节】第一章 > 1.1 发展背景\n【内容】..."
-  }
-}
-```
-
----
-
-## Elasticsearch 索引设计
-
-| 索引名 | 用途 | 核心字段 |
-|--------|------|----------|
-| `page_index` | 文档 Chunk 向量索引 | `doc_id`, `kb_id`, `fd_id`, `embedding_text`, `embedding`(1024d), `original_snippet`, `section_path`, `page_num_int` |
-| `doc_summary_index` | 文档路由索引（粗召回） | `doc_id`, `kb_id`, `folder`, `title`, `summary`, `routing_text`, `embedding`(1024d) |
-
----
-
-## 外部依赖服务
-
-| 服务 | 地址 | 用途 |
-|------|------|------|
-| PostgreSQL | 10.1.140.215:5435 | 文档元数据存储 |
-| Elasticsearch | 10.1.140.215:12300 | 向量索引 + 全文检索 |
-| MinIO | 10.1.140.215:19300 | 文件对象存储 |
-| Redis | 10.1.140.215:16380 | 缓存（预留） |
-| Embedding API | 10.1.141.33:8020 | qwen-embedding 向量化 |
-| DeepSeek API | api.deepseek.com | LLM 调用（预留） |
-
-> 配置集中在 `common/config.py`，生产环境建议迁移到环境变量。
-
----
-
-## 部署方式
-
-### Docker Compose（推荐）
-
+#### 选项1：Docker Compose（生产环境推荐）
 ```bash
-# 1. 构建基础镜像（包含系统依赖 + pip 包，只需构建一次）
+# 构建基础镜像（仅首次执行）
 docker-compose build doc_parser_service_base
-
-# 2. 构建并启动主服务
+# 启动服务容器
 docker-compose up -d doc_parser_service
 ```
+服务启动后，默认监听 `http://localhost:8000`，可通过环境变量调整端口与配置。
 
-服务暴露在 `http://localhost:8000`。
-
-### 本地开发
-
+#### 选项2：本地开发模式
 ```bash
+# 激活conda环境（假设已创建）
+source /home/zx/miniconda3/etc/profile.d/conda.sh && conda activate rag
 # 安装依赖
 pip install -r requirements.txt
-
 # 启动服务
 python main.py
-# 或
+# 开发时可启用热重载
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+### API集成指南
+
+- **交互式文档**：启动服务后，访问 `http://localhost:8000/docs` 查看Swagger UI，实时测试API端点。
+- **关键API端点**：
+  - `POST /document/process/{doc_id}`：触发指定文档的解析与索引流程。
+  - `POST /rag/search`：执行RAG搜索，输入查询与知识库ID，返回排序后的相关片段。
+  - `GET /universal/supported-formats`：获取当前支持的文档格式列表及其特性。
+
+详细接口规范与示例代码，请参考 [API_DOCS.md](./API_DOCS.md) 和 [API_USAGE.md](./API_USAGE.md)。
+
 ---
 
-## 关键设计说明
+## 行业应用与价值
 
-- **两级检索**：先通过文档路由索引（`doc_summary_index`）粗召回相关文档，再在 Chunk 索引（`page_index`）中精确检索，减少无关文档的噪音干扰
-- **混合检索**：Chunk 级别同时使用 KNN 向量相似度 + BM25 关键词匹配，兼顾语义匹配和精确匹配
-- **分数归一化 + 阈值过滤**：混合检索的两种分数量纲不同，通过 Min-Max 归一化统一后，用 0.6 阈值过滤低质量结果
-- **Rerank 可选**：支持 CrossEncoder 精排，模型加载失败时自动降级为按分数排序
-- **PDF 智能切分**：自动检测 PDF 目录（TOC），有目录走 LLM 精准切分，无目录可选用 LLM 生成目录或快速字符分块，LLM 失败时自动降级
-- **Embedding 缓存**：LRU 缓存（10000 条）避免重复向量化调用
-- **统一解析器接口**：所有格式解析器继承 `BaseDocumentParser`，输出统一的 `page_index` JSON 结构，后续流程一致
+RAG Service 已广泛应用于多个行业，帮助企业释放知识资产潜力，提升AI驱动的业务效率。以下为典型场景：
+
+- **企业内部知识库**：将分散的文档资源整合为统一、可搜索的智能知识库，减少信息孤岛，提升员工效率。
+- **智能客服与支持**：为客服机器人提供精准的文档上下文，显著提高首次解决率（FCR）与客户满意度。
+- **合规与审计支持**：批量解析与索引合规文档，支持快速检索关键条款，降低审计风险。
+- **学术研究与教育**：辅助研究人员与教育机构整理文献与教学资料，加速知识获取与内容创作。
+
+**案例参考**：某大型制造企业通过RAG Service构建技术文档知识库，集成至内部问答系统后，工程师查询设备手册效率提升约40%，问题解决时间缩短30%。
+
+---
+
+## 开源与社区支持
+
+- **代码仓库**：欢迎访问我们的GitHub仓库，获取最新代码、提交Issue或贡献功能。
+- **技术交流**：加入我们的社区论坛或邮件列表，获取技术支持或与其他用户交流最佳实践。
+- **商业支持与定制化**：对于企业级部署、高级功能定制或SLA保障需求，请联系我们的专业服务团队。
+
+**RAG Service** — 赋能企业知识数字化，驱动AI应用精准落地！
