@@ -15,9 +15,9 @@ from sqlalchemy import text
 from app.core.database import SessionLocal
 from app.services.minio_service import MinioService
 
-DATASET_DIR = "/home/rag/dataset/dataset"
+DATASET_DIR = "/home/zx/rag/dataset/dataset"
 BUCKET_NAME = "deepsearch"
-KB_ID = "batch_test_kb_001"
+KB_ID = "test01"
 FD_ID = "0"
 API_BASE = "http://localhost:8000"
 

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from typing import Dict, Any, AsyncGenerator, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from common.config import ELASTICSEARCH_INDEX
+from common.config import ELASTICSEARCH_INDEX, MINIO_IP, MINIO_PORT
 
 from ..core.database import SessionLocal
 from ..services.universal_rag_service import UniversalRagService
@@ -31,6 +31,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.pat
 BUCKET_NAME = "deepsearch"
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
+PROCESS_BAT_SEMAPHORE = asyncio.Semaphore(2)
 
 
 def _find_json_nodes_by_id(nodes, target_id: str, id_fields, path=None):
@@ -273,7 +274,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
     try:
         # --- 1. 从 MinIO 下载源文件 ---
         minio_service = MinioService()
-        suffix = os.path.splitext(document.title)[1] or ""
+        suffix = os.path.splitext(document.source_path)[1] or os.path.splitext(document.title)[1] or ""
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             temp_src_path = tmp.name
 
@@ -287,7 +288,8 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
             await _notify(20.0, "已是 PDF，跳过转换")
         elif ext in SUPPORTED_EXTENSIONS:
             await _notify(15.0, f"正在将 {ext} 转换为 PDF")
-            temp_pdf_path = convert_to_pdf(temp_src_path)
+            source_file_url = f"http://{MINIO_IP}:{MINIO_PORT}/{BUCKET_NAME}{document.source_path}"
+            temp_pdf_path = convert_to_pdf(temp_src_path, source_url=source_file_url)
             # 上传 PDF 到 MinIO，路径与 source_path 对应（仅替换扩展名）
             source_no_ext = os.path.splitext(document.source_path)[0]
             pdf_object_name = source_no_ext + ".pdf"
@@ -437,8 +439,13 @@ async def process_bat_single(
             last_sent[0] = p
             await progress_queue.put(p)
 
+        async def run_queued_process():
+            await progress_queue.put(0)
+            async with PROCESS_BAT_SEMAPHORE:
+                return await _process_single_doc(db, doc_id, progress_callback=on_progress)
+
         # 启动处理任务
-        task = asyncio.create_task(_process_single_doc(db, doc_id, progress_callback=on_progress))
+        task = asyncio.create_task(run_queued_process())
 
         # 持续发送进度事件，直到任务完成
         while not task.done():

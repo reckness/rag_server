@@ -14,10 +14,10 @@ class ESService:
         self.es = ES_CONN.get_conn()
 
     # ================================================================
-    # 第一重：doc_index 关键词召回（宽松，有就召回）
+    # 第一重：doc_index 混合召回（宽松，有就召回）
     # ================================================================
-    def retrieve_docs(self, query, kb_ids, fd_ids=None, topk=50):
-        """BM25 关键词匹配 doc_index，宽松召回候选文档"""
+    def retrieve_docs(self, query, kb_ids, fd_ids=None, query_vec=None, topk=20, rrf_k=60):
+        """在 doc_index 中做 KNN + BM25 RRF 融合召回候选文档"""
         if not kb_ids:
             raise ValueError("kb_ids不能为空")
         if not isinstance(kb_ids, list):
@@ -29,32 +29,67 @@ class ESService:
         if fd_ids:
             must.append({"terms": {"fd_id": fd_ids}})
 
-        should = [
-            {"match": {"title": {"query": query, "boost": 2}}},
-            {"match": {"keywords": {"query": query}}},
-        ]
+        doc_filter = {"bool": {"must": must}}
 
-        body = {
+        bm25_body = {
             "size": topk,
             "query": {
                 "bool": {
-                    "must": must,
-                    "should": should,
-                    "minimum_should_match": 0,
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["title^3", "summary^2", "searchable_text", "keywords"],
+                            }
+                        }
+                    ],
+                    "filter": must,
                 }
             },
             "_source": ["doc_id"],
         }
 
-        res = self.es.search(index=ELASTICSEARCH_DOC_INDEX, body=body)
+        bm25_res = self.es.search(index=ELASTICSEARCH_DOC_INDEX, body=bm25_body)
+
+        knn_res = {"hits": {"hits": []}}
+        if query_vec:
+            knn_body = {
+                "size": topk,
+                "knn": {
+                    "field": "embedding",
+                    "query_vector": query_vec,
+                    "k": topk,
+                    "num_candidates": 200,
+                    "filter": doc_filter,
+                },
+                "_source": ["doc_id"],
+            }
+            knn_res = self.es.search(index=ELASTICSEARCH_DOC_INDEX, body=knn_body)
+
+        rrf_scores: Dict[str, float] = {}
+        doc_meta: Dict[str, Dict] = {}
+
+        for rank, hit in enumerate(knn_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            doc_meta[key] = hit["_source"]
+
+        for rank, hit in enumerate(bm25_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            if key not in doc_meta:
+                doc_meta[key] = hit["_source"]
+
+        ranked_docs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:topk]
 
         seen = set()
         doc_ids = []
-        for h in res["hits"]["hits"]:
-            did = h["_source"]["doc_id"]
+        for key, _ in ranked_docs:
+            did = doc_meta[key]["doc_id"]
             if did not in seen:
                 seen.add(did)
                 doc_ids.append(did)
+
         return doc_ids
 
     # ================================================================

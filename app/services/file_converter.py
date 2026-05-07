@@ -6,6 +6,11 @@ import os
 import subprocess
 import tempfile
 import shutil
+import base64
+import re
+import urllib.parse
+
+import requests
 
 
 # 支持的源格式 → 分组
@@ -15,6 +20,8 @@ SUPPORTED_EXTENSIONS = {
     ".ppt", ".pptx",       # PPT
     ".xls", ".xlsx",       # Excel
 }
+
+ONLINE_PREVIEW_BASE_URL = os.getenv("ONLINE_PREVIEW_BASE_URL", "http://10.1.140.215:8012")
 
 
 def is_supported(filename: str) -> bool:
@@ -60,7 +67,46 @@ def _run_libreoffice_convert(source_path: str, output_dir: str, target_format: s
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
+def _convert_to_pdf_via_online_preview(source_url: str, output_dir: str, output_filename: str = None) -> str:
+    encoded_source_url = base64.b64encode(source_url.encode("utf-8")).decode("utf-8")
+    preview_url = f"{ONLINE_PREVIEW_BASE_URL.rstrip('/')}/onlinePreview?url={encoded_source_url}"
+    preview_resp = requests.get(preview_url, timeout=120)
+    preview_resp.raise_for_status()
+
+    content_type = preview_resp.headers.get("content-type", "")
+    if "application/pdf" in content_type or preview_resp.content.startswith(b"%PDF-"):
+        pdf_path = os.path.join(output_dir, output_filename or "online_preview.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(preview_resp.content)
+        if _is_pdf_valid(pdf_path):
+            return pdf_path
+        raise RuntimeError(f"在线预览服务返回的 PDF 异常: {pdf_path}")
+
+    match = re.search(r"var\s+url\s*=\s*'([^']+\.pdf)'", preview_resp.text)
+    if not match:
+        raise RuntimeError("在线预览服务未返回可下载的 PDF 地址")
+
+    pdf_url = match.group(1)
+    encoded_pdf_url = base64.b64encode(pdf_url.encode("utf-8")).decode("utf-8")
+    download_url = (
+        f"{ONLINE_PREVIEW_BASE_URL.rstrip('/')}/getCorsFile?"
+        f"urlPath={urllib.parse.quote(encoded_pdf_url)}&key=false"
+    )
+    download_resp = requests.get(download_url, timeout=120)
+    download_resp.raise_for_status()
+    if not download_resp.content.startswith(b"%PDF-"):
+        raise RuntimeError("在线预览服务下载结果不是 PDF")
+
+    pdf_path = os.path.join(output_dir, output_filename or os.path.basename(urllib.parse.urlparse(pdf_url).path))
+    with open(pdf_path, "wb") as f:
+        f.write(download_resp.content)
+
+    if _is_pdf_valid(pdf_path):
+        return pdf_path
+    raise RuntimeError(f"在线预览服务生成的 PDF 异常: {pdf_path}")
+
+
+def convert_to_pdf(source_path: str, output_dir: str = None, source_url: str = None) -> str:
     """
     将文件转换为 PDF。
 
@@ -84,6 +130,19 @@ def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
 
     os.makedirs(output_dir, exist_ok=True)
 
+    base_name = os.path.splitext(os.path.basename(source_path))[0]
+    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+
+    if source_url:
+        try:
+            return _convert_to_pdf_via_online_preview(
+                source_url=source_url,
+                output_dir=output_dir,
+                output_filename=f"{base_name}.pdf",
+            )
+        except Exception as e:
+            print(f"在线预览服务转换失败，回退 LibreOffice: {e}")
+
     result = _run_libreoffice_convert(
         source_path=source_path,
         output_dir=output_dir,
@@ -95,10 +154,6 @@ def convert_to_pdf(source_path: str, output_dir: str = None) -> str:
             f"LibreOffice 转换失败 (exit={result.returncode}): "
             f"{result.stderr or result.stdout}"
         )
-
-    # LibreOffice 输出的 PDF 文件名 = 源文件名（去扩展名）+ .pdf
-    base_name = os.path.splitext(os.path.basename(source_path))[0]
-    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
 
     if not os.path.exists(pdf_path):
         raise RuntimeError(

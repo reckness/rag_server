@@ -17,6 +17,40 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rag.page_index_md import md_to_tree
 from rag.utils import _detect_headers_footers, _remove_headers_footers
 
+
+def build_doc_summary_from_chapter_summaries(structure):
+    summaries = []
+    for node in structure or []:
+        title = (node.get("title") or "").strip()
+        summary = (node.get("prefix_summary") or node.get("summary") or "").strip()
+        if summary:
+            summaries.append(f"{title}：{summary}" if title else summary)
+    return "\n".join(summaries)
+
+
+def generate_doc_summary_from_chapter_summaries(structure):
+    chapter_summaries = build_doc_summary_from_chapter_summaries(structure)
+    if not chapter_summaries.strip():
+        return ""
+    prompt = f"""你获得了一篇文档各章节的摘要，请基于这些章节摘要生成一段文章级总摘要。
+
+要求：
+1. 控制在 300-500 字
+2. 概括文档主题、核心内容、关键结论和整体结构
+3. 不要逐章罗列
+4. 不要添加章节摘要中没有的信息
+5. 直接返回总摘要，不要包含任何其他文本
+
+各章节摘要：
+{chapter_summaries}
+"""
+    try:
+        return llm_call(prompt, max_tokens=2048)
+    except Exception as e:
+        print(f"[摘要] 文章总摘要生成失败，回退章节摘要拼接: {e}")
+        return chapter_summaries
+
+
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("pdf", "辽宁省低空经济高质量发展路径研究.pdf")
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
@@ -165,6 +199,7 @@ async def process_pdf_simple(
         if_add_node_text='yes' if if_add_node_text else 'no',
         if_add_node_id='yes',
     )
+    result["summary"] = generate_doc_summary_from_chapter_summaries(result.get("structure", []))
 
     # 保存 JSON 结果（ESConverter / MinIO 上传需要从磁盘读取，由调用方负责清理）
     json_path = os.path.join(output_dir, f"{pdf_name}_md_structure.json")

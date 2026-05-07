@@ -121,8 +121,8 @@ class RagService:
         # 1️⃣ embedding
         query_vec = await get_embedding(query)
 
-        # 2️⃣ 第一重：doc_index 关键词召回（宽松，有就召回）
-        doc_ids = self.es.retrieve_docs(query, kb_ids, fd_ids)
+        # 2️⃣ 第一重：doc_index 混合召回（宽松，有就召回）
+        doc_ids = self.es.retrieve_docs(query, kb_ids, fd_ids, query_vec,topk=20)
 
         if not doc_ids:
             return {"chunks": [], "context": ""}

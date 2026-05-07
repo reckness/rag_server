@@ -14,6 +14,7 @@ import re
 import requests
 import pymupdf
 import threading
+import math
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,6 +22,40 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rag.page_index_md import md_to_tree, extract_nodes_from_markdown, extract_node_text_content, build_tree_from_nodes, format_structure, generate_summaries_for_structure_md, write_node_id
 from rag.utils import _detect_headers_footers, _remove_headers_footers
+
+
+def build_doc_summary_from_chapter_summaries(structure):
+    summaries = []
+    for node in structure or []:
+        title = (node.get("title") or "").strip()
+        summary = (node.get("prefix_summary") or node.get("summary") or "").strip()
+        if summary:
+            summaries.append(f"{title}：{summary}" if title else summary)
+    return "\n".join(summaries)
+
+
+def generate_doc_summary_from_chapter_summaries(structure):
+    chapter_summaries = build_doc_summary_from_chapter_summaries(structure)
+    if not chapter_summaries.strip():
+        return ""
+    prompt = f"""你获得了一篇文档各章节的摘要，请基于这些章节摘要生成一段文章级总摘要。
+
+要求：
+1. 控制在 300-500 字
+2. 概括文档主题、核心内容、关键结论和整体结构
+3. 不要逐章罗列
+4. 不要添加章节摘要中没有的信息
+5. 直接返回总摘要，不要包含任何其他文本
+
+各章节摘要：
+{chapter_summaries}
+"""
+    try:
+        return llm_call(prompt, max_tokens=2048)
+    except Exception as e:
+        print(f"[摘要] 文章总摘要生成失败，回退章节摘要拼接: {e}")
+        return chapter_summaries
+
 
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("pdf", "珠三角电子信息产业集群创新网络演化及其机理研究_王炜.pdf")
@@ -37,6 +72,13 @@ IF_ADD_NODE_TEXT = True
 TOC_SCAN_PAGES = 15          # 扫描前 N 页寻找目录
 MAX_TOKENS_PER_CHUNK = 6000  # 每个分块最大字符数（安全阈值）
 CHUNK_TOKEN_THRESHOLD = 20000  # 章节 token 超过此阈值则按小节拆分
+MERGE_SMALL_CHUNKS = True
+SMALL_CHUNK_CHAR_THRESHOLD = 100
+ENABLE_SEMANTIC_PARAGRAPH_SPLIT = True
+SEMANTIC_SPLIT_SIMILARITY_THRESHOLD = 0.6
+SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS = 100
+SEMANTIC_SPLIT_MIN_SEGMENT_CHARS = 80
+SEMANTIC_SPLIT_EMBEDDING_WORKERS = 32
 
 ENABLE_PDF_CLEANING = True   # 是否启用 PDF 文本清洗规则
 
@@ -822,6 +864,174 @@ def pages_to_chunk_text(cleaned_pages, start_page, end_page):
     return "\n\n".join(parts)
 
 
+def merge_small_chunks_to_previous(chunks, cleaned_pages, char_threshold=SMALL_CHUNK_CHAR_THRESHOLD):
+    if not chunks:
+        return chunks
+
+    merged = []
+    for chunk in chunks:
+        chunk_text = pages_to_chunk_text(cleaned_pages, chunk['start_page'], chunk['end_page'])
+        char_count = len(re.sub(r"\s+", "", chunk_text))
+        if merged and char_count < char_threshold:
+            prev = merged[-1]
+            old_title = prev['title']
+            prev['title'] = f"{prev['title']} + {chunk['title']}"
+            prev['end_page'] = max(prev['end_page'], chunk['end_page'])
+            print(
+                f"  [小块合并] {chunk['title']} ({char_count} 字符, p{chunk['start_page']}-{chunk['end_page']}) "
+                f"合并到上一个分块 {old_title}"
+            )
+            continue
+        merged.append(chunk)
+
+    if len(merged) < len(chunks):
+        print(f"  [小块合并] 合并后分块数: {len(chunks)} -> {len(merged)}")
+    return merged
+
+
+def remove_output_location_fields(nodes):
+    for node in nodes or []:
+        node.pop("bbox", None)
+        node.pop("page_locations", None)
+        if node.get("nodes"):
+            remove_output_location_fields(node["nodes"])
+    return nodes
+
+
+def _cosine_similarity(vec1, vec2):
+    if not vec1 or not vec2:
+        return 1.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+    if not norm1 or not norm2:
+        return 1.0
+    return dot / (norm1 * norm2)
+
+
+def _split_text_to_sentences(text):
+    parts = re.findall(r'[^。]+。', text.strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _is_markdown_table(text):
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
+    if len(table_lines) < 2:
+        return False
+    return any(re.match(r'^\|\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|$', line) for line in table_lines)
+
+
+def _semantic_split_paragraph(
+    text,
+    similarity_threshold=SEMANTIC_SPLIT_SIMILARITY_THRESHOLD,
+    min_paragraph_chars=SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS,
+    min_segment_chars=SEMANTIC_SPLIT_MIN_SEGMENT_CHARS,
+    embedding_workers=SEMANTIC_SPLIT_EMBEDDING_WORKERS,
+):
+    text = (text or "").strip()
+    if len(text) < min_paragraph_chars:
+        return [text] if text else []
+
+    sentences = _split_text_to_sentences(text)
+    if len(sentences) <= 1:
+        return [text]
+
+    from common.nlp.embedding_client import get_embedding
+
+    max_workers = max(1, min(embedding_workers, len(sentences)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        embeddings = list(executor.map(get_embedding, sentences))
+
+    segments = []
+    current = [sentences[0]]
+    current_len = len(sentences[0])
+
+    for idx in range(1, len(sentences)):
+        similarity = _cosine_similarity(embeddings[idx - 1], embeddings[idx])
+        sentence = sentences[idx]
+        should_split = similarity < similarity_threshold and current_len >= min_segment_chars
+        if should_split:
+            segments.append("".join(current).strip())
+            current = [sentence]
+            current_len = len(sentence)
+        else:
+            current.append(sentence)
+            current_len += len(sentence)
+
+    if current:
+        segments.append("".join(current).strip())
+
+    merged = []
+    for segment in segments:
+        if merged and len(segment) < min_segment_chars:
+            merged[-1] = f"{merged[-1]}{segment}"
+        else:
+            merged.append(segment)
+    return [segment for segment in merged if segment]
+
+
+def semantic_split_leaf_paragraphs(
+    nodes,
+    similarity_threshold=SEMANTIC_SPLIT_SIMILARITY_THRESHOLD,
+    min_paragraph_chars=SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS,
+    min_segment_chars=SEMANTIC_SPLIT_MIN_SEGMENT_CHARS,
+    embedding_workers=SEMANTIC_SPLIT_EMBEDDING_WORKERS,
+):
+    split_count = 0
+    new_node_count = 0
+    paragraph_count = 0
+    sentence_count = 0
+    for node in nodes or []:
+        if node.get('nodes'):
+            child_split_count, child_new_node_count, child_paragraph_count, child_sentence_count = semantic_split_leaf_paragraphs(
+                node['nodes'],
+                similarity_threshold=similarity_threshold,
+                min_paragraph_chars=min_paragraph_chars,
+                min_segment_chars=min_segment_chars,
+                embedding_workers=embedding_workers,
+            )
+            split_count += child_split_count
+            new_node_count += child_new_node_count
+            paragraph_count += child_paragraph_count
+            sentence_count += child_sentence_count
+            continue
+
+        text = (node.get('text') or '').strip()
+        if not text:
+            continue
+        if _is_markdown_table(text):
+            continue
+        paragraph_count += 1
+        sentence_count += len(_split_text_to_sentences(text))
+
+        segments = _semantic_split_paragraph(
+            text,
+            similarity_threshold=similarity_threshold,
+            min_paragraph_chars=min_paragraph_chars,
+            min_segment_chars=min_segment_chars,
+            embedding_workers=embedding_workers,
+        )
+        if len(segments) <= 1:
+            continue
+
+        node['text'] = ''
+        node['nodes'] = []
+        for idx, segment in enumerate(segments, 1):
+            node['nodes'].append({
+                'title': f"{node['title']} - 语义段{idx}",
+                'text': segment,
+                'start_page': node.get('start_page'),
+                'end_page': node.get('end_page'),
+            })
+        split_count += 1
+        new_node_count += len(segments)
+
+    return split_count, new_node_count, paragraph_count, sentence_count
+
+
 # ==================== Step 5: 分块处理并合并 ====================
 def build_subtree_from_markdown(md_content):
     """从 Markdown 内容构建子树（同步版本，不含摘要）"""
@@ -976,6 +1186,12 @@ async def process_pdf_chunked(
     if_add_node_text: bool = IF_ADD_NODE_TEXT,
     toc_scan_pages: int = TOC_SCAN_PAGES,
     pages_per_chunk: int = 10,
+    merge_small_chunks: bool = MERGE_SMALL_CHUNKS,
+    small_chunk_char_threshold: int = SMALL_CHUNK_CHAR_THRESHOLD,
+    enable_semantic_paragraph_split: bool = ENABLE_SEMANTIC_PARAGRAPH_SPLIT,
+    semantic_split_similarity_threshold: float = SEMANTIC_SPLIT_SIMILARITY_THRESHOLD,
+    semantic_split_min_paragraph_chars: int = SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS,
+    semantic_split_min_segment_chars: int = SEMANTIC_SPLIT_MIN_SEGMENT_CHARS,
 ):
     """
     长文档 PDF → 分块 Markdown → 合并 JSON 树结构
@@ -993,6 +1209,8 @@ async def process_pdf_chunked(
         if_add_node_text: 是否保留节点文本
         toc_scan_pages: 扫描前 N 页寻找目录
         pages_per_chunk: 无目录时每块页数
+        merge_small_chunks: 是否将过短分块合并到上一个分块
+        small_chunk_char_threshold: 小于该字符数的分块会合并到上一个分块
 
     Returns:
         dict: {"result": 结构化JSON, "json_path": JSON文件路径, "md_path": MD文件路径}
@@ -1051,6 +1269,17 @@ async def process_pdf_chunked(
     if len(truncated_chunks) < len(chunks):
         print(f"  保留 {len(truncated_chunks)}/{len(chunks)} 个分块")
     chunks = truncated_chunks
+
+    # Step 3.7: 将过短分块合并到上一个分块
+    if merge_small_chunks:
+        print("\n" + "=" * 60)
+        print(f"[Step 3.7] 小分块合并（小于 {small_chunk_char_threshold} 字符合并到上一个分块）")
+        print("=" * 60)
+        chunks = merge_small_chunks_to_previous(
+            chunks,
+            cleaned_pages,
+            char_threshold=small_chunk_char_threshold,
+        )
 
     # Step 4: 逐块处理（动态并发，按字符容量池控制）
     CHAR_CAPACITY = 1000000  # 全局字符容量池
@@ -1205,6 +1434,25 @@ async def process_pdf_chunked(
     n_split = split_leaf_by_paragraphs(merged_tree)
     print(f"  拆分了 {n_split} 个叶子节点")
 
+    if enable_semantic_paragraph_split:
+        print("\n" + "=" * 60)
+        print("[Step 5.6] 使用 embedding 对最小段落进行语义切分")
+        print("=" * 60)
+        semantic_start = _time.time()
+        semantic_split_count, semantic_new_node_count, semantic_paragraph_count, semantic_sentence_count = semantic_split_leaf_paragraphs(
+            merged_tree,
+            similarity_threshold=semantic_split_similarity_threshold,
+            min_paragraph_chars=semantic_split_min_paragraph_chars,
+            min_segment_chars=semantic_split_min_segment_chars,
+        )
+        semantic_elapsed = _time.time() - semantic_start
+        print(
+            f"  [语义切分统计] 耗时: {semantic_elapsed:.1f}s, "
+            f"处理段落数: {semantic_paragraph_count}, 句子数: {semantic_sentence_count}, "
+            f"切分段落数: {semantic_split_count}, 新增语义子段数: {semantic_new_node_count}, "
+            f"embedding并发: {SEMANTIC_SPLIT_EMBEDDING_WORKERS}"
+        )
+
     assign_node_ids(merged_tree)
 
     page_blocks = extract_page_text_blocks(pdf_path)
@@ -1216,7 +1464,7 @@ async def process_pdf_chunked(
         SUMMARY_CHAR_CAPACITY = 45000
 
         print(f"\n[摘要] 正在为各章节并行生成摘要（字符容量池={SUMMARY_CHAR_CAPACITY}）...")
-        formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'bbox', 'page_locations', 'summary', 'prefix_summary', 'text', 'nodes'])
+        formatted = format_structure(merged_tree, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'summary', 'prefix_summary', 'text', 'nodes'])
 
         def _collect_all_text(node):
             """递归收集一个节点及其所有子节点的文本"""
@@ -1300,8 +1548,9 @@ async def process_pdf_chunked(
             print(f"  [摘要统计] 耗时: {summary_elapsed:.1f}s, 峰值并发: {_sum_peak[0]}")
 
         if not if_add_node_text:
-            formatted = format_structure(formatted, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'bbox', 'page_locations', 'summary', 'prefix_summary', 'nodes'])
+            formatted = format_structure(formatted, order=['title', 'node_id', 'start_page', 'end_page', 'page_index', 'summary', 'prefix_summary', 'nodes'])
         merged_tree = formatted
+    remove_output_location_fields(merged_tree)
 
     # Step 6: 保存结果
     print("\n" + "=" * 60)
@@ -1309,6 +1558,7 @@ async def process_pdf_chunked(
     print("=" * 60)
     result = {
         'doc_name': pdf_name,
+        'summary': generate_doc_summary_from_chapter_summaries(merged_tree),
         'total_pages': len(cleaned_pages),
         'toc_detected': toc_entries is not None,
         'num_chunks': len(chunks),
