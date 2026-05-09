@@ -1,3 +1,5 @@
+import asyncio
+import os
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app import api_router
@@ -9,54 +11,66 @@ Base.metadata.create_all(bind=engine)
 
 # Rerank 配置（通过远程 HTTP API 调用）
 RERANK_API_URL = "http://10.1.141.33:8474/rerank"
+UPLOADED_DOCUMENT_POLL_INTERVAL = int(os.getenv("UPLOADED_DOCUMENT_POLL_INTERVAL", "5"))
+UPLOADED_DOCUMENT_POLL_LIMIT = int(os.getenv("UPLOADED_DOCUMENT_POLL_LIMIT", "100"))
+PROCESSING_DOC_IDS = set()
 
 def load_model():
     """初始化 rerank（远程 API 模式，无需加载本地模型）"""
     print(f"Rerank API 地址: {RERANK_API_URL}")
     return RERANK_API_URL
 
-# 处理上传的文档
-async def process_uploaded_documents():
-    """处理状态为uploaded的文档"""
-    from app.repository.document_repository import DocumentRepository
-    from app.services.document_processing_service import DocumentProcessingService
-    from app.core.database import SessionLocal
-    
-    db = SessionLocal()
+async def process_uploaded_document(doc_id: str, title: str):
+    from app.api.universal_rag_api import _process_single_doc
+
     try:
-        # 获取所有状态为uploaded的文档
-        uploaded_documents = DocumentRepository.get_by_status(db, "uploaded")
-        
-        if not uploaded_documents:
-            print("没有需要处理的上传文档")
-            return
-        
-        print(f"开始处理 {len(uploaded_documents)} 个上传文档")
-        
-        for document in uploaded_documents:
-            try:
-                print(f"处理文档: {document.title} (ID: {document.doc_id})")
-                # 调用文档处理服务
-                await DocumentProcessingService.process_document(db, document.doc_id)
-                print(f"文档处理完成: {document.title}")
-            except Exception as e:
-                print(f"处理文档 {document.title} 时出错: {str(e)}")
-                # 继续处理下一个文档
-                continue
+        print(f"开始解析上传文档: {title} (ID: {doc_id})")
+        result = await _process_single_doc(None, doc_id)
+        if result.get("success"):
+            print(f"上传文档解析完成: {title} (ID: {doc_id})")
+        else:
+            print(f"上传文档解析失败: {title} (ID: {doc_id}), {result.get('error')}")
+    except Exception as e:
+        print(f"上传文档解析异常: {title} (ID: {doc_id}), {str(e)}")
     finally:
-        db.close()
+        PROCESSING_DOC_IDS.discard(doc_id)
+
+
+async def poll_uploaded_documents():
+    from app.repository.document_repository import DocumentRepository
+    from app.core.database import SessionLocal
+
+    while True:
+        db = SessionLocal()
+        try:
+            uploaded_documents = DocumentRepository.get_uploaded_ordered(db, limit=UPLOADED_DOCUMENT_POLL_LIMIT)
+            for document in uploaded_documents:
+                doc_id = str(document.doc_id)
+                if doc_id in PROCESSING_DOC_IDS:
+                    continue
+                PROCESSING_DOC_IDS.add(doc_id)
+                asyncio.create_task(process_uploaded_document(doc_id, document.title))
+        except Exception as e:
+            print(f"轮询 uploaded 文档失败: {str(e)}")
+        finally:
+            db.close()
+        await asyncio.sleep(UPLOADED_DOCUMENT_POLL_INTERVAL)
 
 # 生命周期管理
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 只在应用启动时加载一次
     app.state.model = load_model()
-    
-    # 处理上传的文档
-    #await process_uploaded_documents()
-    
-    yield
-    # 清理资源
+    app.state.uploaded_document_poll_task = asyncio.create_task(poll_uploaded_documents())
+
+    try:
+        yield
+    finally:
+        app.state.uploaded_document_poll_task.cancel()
+        try:
+            await app.state.uploaded_document_poll_task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(
     title="Deep Search API",

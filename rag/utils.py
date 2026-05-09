@@ -33,7 +33,7 @@ def count_tokens(text, model=None):
     # 简单的token计数近似
     return len(text.split())
 
-def calculate_token_size(payload, model_name="Qwen3-8B"):
+def calculate_token_size(payload, model_name="qwen3.5-35b-int4"):
     """
     计算请求的token大小
     
@@ -92,13 +92,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             # 记录开始时间
             start_time = time.time()
             
-            url = "http://10.1.141.33:8001/v1/chat/completions"
+            url = "http://10.1.141.33:8080/v1/chat/completions"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer "
             }
             payload = {
-                "model": "Qwen3-8B",
+                "model": "qwen3.5-35b-int4",
                 "messages": messages,
                 "max_tokens": 4096,
                 "chat_template_kwargs": {
@@ -212,13 +212,13 @@ async def llm_acompletion(model, prompt):
             # 记录开始时间
             start_time = time.time()
             
-            url = "http://10.1.141.33:8001/v1/chat/completions"
+            url = "http://10.1.141.33:8080/v1/chat/completions"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer "
             }
             payload = {
-                "model": "Qwen3-8B",
+                "model": "qwen3.5-35b-int4",
                 "messages": messages,
                 "max_tokens": 4096,
                 "chat_template_kwargs": {

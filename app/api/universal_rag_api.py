@@ -7,6 +7,9 @@ import sys
 import json
 import asyncio
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -31,7 +34,30 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.pat
 BUCKET_NAME = "deepsearch"
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
-PROCESS_BAT_SEMAPHORE = asyncio.Semaphore(2)
+PROCESS_BAT_CHAR_CAPACITY = int(os.getenv("PROCESS_BAT_CHAR_CAPACITY", "1000000"))
+PROCESS_BAT_CHAR_CAPACITY_CONDITION = asyncio.Condition()
+PROCESS_BAT_USED_CHARS = 0
+
+# 专用线程池：避免默认线程池（max_workers=5）成为瓶颈
+_DOC_THREAD_POOL = ThreadPoolExecutor(max_workers=64, thread_name_prefix="doc_proc")
+
+
+async def _acquire_process_bat_char_capacity(char_count: int):
+    global PROCESS_BAT_USED_CHARS
+    capacity_cost = min(max(char_count, 1), PROCESS_BAT_CHAR_CAPACITY)
+    async with PROCESS_BAT_CHAR_CAPACITY_CONDITION:
+        while PROCESS_BAT_USED_CHARS + capacity_cost > PROCESS_BAT_CHAR_CAPACITY:
+            await PROCESS_BAT_CHAR_CAPACITY_CONDITION.wait()
+        PROCESS_BAT_USED_CHARS += capacity_cost
+        return capacity_cost, PROCESS_BAT_USED_CHARS
+
+
+async def _release_process_bat_char_capacity(capacity_cost: int):
+    global PROCESS_BAT_USED_CHARS
+    async with PROCESS_BAT_CHAR_CAPACITY_CONDITION:
+        PROCESS_BAT_USED_CHARS = max(0, PROCESS_BAT_USED_CHARS - capacity_cost)
+        PROCESS_BAT_CHAR_CAPACITY_CONDITION.notify_all()
+        return PROCESS_BAT_USED_CHARS
 
 
 def _find_json_nodes_by_id(nodes, target_id: str, id_fields, path=None):
@@ -243,13 +269,42 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
 
     progress_callback: 可选的异步回调函数 async fn(percent, message)
     """
+    use_short_db_session = db is None
+
+    def _document_snapshot(document):
+        return SimpleNamespace(
+            doc_id=document.doc_id,
+            kb_id=document.kb_id,
+            fd_id=document.fd_id,
+            title=document.title,
+            source_path=document.source_path,
+        )
+
+    def _update_document(**kwargs):
+        if use_short_db_session:
+            short_db = SessionLocal()
+            try:
+                return DocumentRepository.update(short_db, doc_id, **kwargs)
+            finally:
+                short_db.close()
+        return DocumentRepository.update(db, doc_id, **kwargs)
+
     async def _notify(percent: float, msg: str):
         """更新 DB 进度 + 调用回调"""
-        DocumentRepository.update(db, doc_id, progress=percent, progress_msg=msg)
+        _update_document(progress=percent, progress_msg=msg)
         if progress_callback:
             await progress_callback(percent, msg)
 
-    document = DocumentRepository.get_by_id(db, doc_id)
+    if use_short_db_session:
+        short_db = SessionLocal()
+        try:
+            document = DocumentRepository.get_by_id(short_db, doc_id)
+            if document:
+                document = _document_snapshot(document)
+        finally:
+            short_db.close()
+    else:
+        document = DocumentRepository.get_by_id(db, doc_id)
     if not document:
         return {"doc_id": doc_id, "success": False, "error": "文档不存在"}
 
@@ -257,8 +312,8 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         return {"doc_id": doc_id, "success": False, "error": "文档 source_path 为空"}
 
     process_begin_at = datetime.now()
-    DocumentRepository.update(
-        db, doc_id,
+    _update_document(
+        status="processing",
         progress=0.0,
         progress_msg="开始处理文档",
         process_begin_at=process_begin_at,
@@ -294,7 +349,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
             source_no_ext = os.path.splitext(document.source_path)[0]
             pdf_object_name = source_no_ext + ".pdf"
             minio_service.upload_file(BUCKET_NAME, pdf_object_name, temp_pdf_path, content_type="application/pdf")
-            DocumentRepository.update(db, doc_id, pdf_path=pdf_object_name)
+            _update_document(pdf_path=pdf_object_name)
             await _notify(20.0, "PDF 转换并上传完成")
         else:
             return {"doc_id": doc_id, "success": False, "error": f"不支持的文件格式: {ext}"}
@@ -310,33 +365,41 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
                 _page_texts.append("")
         full_text = "".join(_page_texts)
         pdf_doc.close()
-        estimated_tokens = int(len(full_text) / 1.5)
-        await _notify(25.0, f"文档估算 {estimated_tokens} tokens，使用 {'simple' if estimated_tokens <= 8000 else 'chunked'} 模式")
+        char_count = len(full_text)
+        estimated_tokens = int(char_count / 1.5)
+        await _notify(25.0, f"文档字符数 {char_count}，全局字符容量池 {PROCESS_BAT_CHAR_CAPACITY}，估算 {estimated_tokens} tokens，使用 {'simple' if estimated_tokens <= 8000 else 'chunked'} 模式")
 
-        if estimated_tokens <= 8000:
-            from run_pdf_to_md import process_pdf_simple
-            output = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: asyncio.run(process_pdf_simple(
-                    pdf_path=temp_pdf_path,
-                    output_dir=OUTPUT_DIR,
-                    llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                    if_summary=True, if_add_node_text=True,
-                ))
-            )
-            mode_used = "simple"
-        else:
-            from run_pdf_to_md_chunked import process_pdf_chunked
-            output = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: asyncio.run(process_pdf_chunked(
-                    pdf_path=temp_pdf_path,
-                    output_dir=OUTPUT_DIR,
-                    llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                    if_summary=True, if_add_node_text=True,
-                ))
-            )
-            mode_used = "chunked"
+        capacity_cost, used_chars = await _acquire_process_bat_char_capacity(char_count)
+        await _notify(30.0, f"占用 {capacity_cost} 字符，当前已用 {used_chars}/{PROCESS_BAT_CHAR_CAPACITY}，开始解析")
+        print(f"[process_bat调度] doc_id={doc_id} 占用 {capacity_cost} 字符，当前已用 {used_chars}/{PROCESS_BAT_CHAR_CAPACITY}")
+        try:
+            if estimated_tokens <= 8000:
+                from run_pdf_to_md import process_pdf_simple
+                output = await asyncio.get_event_loop().run_in_executor(
+                    _DOC_THREAD_POOL,
+                    lambda: asyncio.run(process_pdf_simple(
+                            pdf_path=temp_pdf_path,
+                            output_dir=OUTPUT_DIR,
+                            llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
+                            if_summary=True, if_add_node_text=True,
+                        ))
+                    )
+                mode_used = "simple"
+            else:
+                from run_pdf_to_md_chunked import process_pdf_chunked
+                output = await asyncio.get_event_loop().run_in_executor(
+                    _DOC_THREAD_POOL,
+                    lambda: asyncio.run(process_pdf_chunked(
+                        pdf_path=temp_pdf_path,
+                        output_dir=OUTPUT_DIR,
+                        llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
+                        if_summary=True, if_add_node_text=True,
+                    ))
+                )
+                mode_used = "chunked"
+        finally:
+            used_chars = await _release_process_bat_char_capacity(capacity_cost)
+            print(f"[process_bat释放] doc_id={doc_id} 归还 {capacity_cost} 字符，当前已用 {used_chars}/{PROCESS_BAT_CHAR_CAPACITY}")
 
         json_path = output["json_path"]
 
@@ -345,7 +408,7 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         json_object_name = source_no_ext + ".json"
         minio_service.upload_file(BUCKET_NAME, json_object_name, json_path)
 
-        DocumentRepository.update(db, doc_id, pageindex_path=json_object_name)
+        _update_document(pageindex_path=json_object_name)
         await _notify(50.0, "文件解析完成，JSON 已上传")
 
         # --- 4. 三级索引写入 (doc / chapter / chunk) ---
@@ -353,33 +416,37 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         k_id = str(document.kb_id)
         f_id = str(document.fd_id)
 
-        chunk_num = await asyncio.to_thread(
-            write_to_three_indices,
-            json_path=json_path,
-            doc_id=d_id, kb_id=k_id, fd_id=f_id,
-            doc_title=document.title,
+        chunk_num = await asyncio.get_event_loop().run_in_executor(
+            _DOC_THREAD_POOL,
+            lambda: write_to_three_indices(
+                json_path=json_path,
+                doc_id=d_id, kb_id=k_id, fd_id=f_id,
+                doc_title=document.title,
+            ),
         )
 
-        DocumentRepository.update(db, doc_id, chunk_num=chunk_num)
+        _update_document(chunk_num=chunk_num)
         await _notify(90.0, f"三级索引写入完成，共 {chunk_num} 个 chunk")
 
         # --- 6. 完成 ---
         process_duration = (datetime.now() - process_begin_at).total_seconds()
-        DocumentRepository.update(db, doc_id, process_duration=process_duration, status="ready")
+        _update_document(process_duration=process_duration, status="ready")
         await _notify(100.0, f"处理完成，耗时 {process_duration:.2f} 秒")
 
         return {
             "doc_id": doc_id,
             "success": True,
             "mode": mode_used,
+            "char_count": char_count,
             "estimated_tokens": estimated_tokens,
             "chunk_num": chunk_num,
             "process_duration": process_duration,
         }
 
     except Exception as e:
-        DocumentRepository.update(
-            db, doc_id,
+        if db is not None:
+            db.rollback()
+        _update_document(
             progress_msg=f"处理失败: {str(e)}",
             status="error",
         )
@@ -441,8 +508,7 @@ async def process_bat_single(
 
         async def run_queued_process():
             await progress_queue.put(0)
-            async with PROCESS_BAT_SEMAPHORE:
-                return await _process_single_doc(db, doc_id, progress_callback=on_progress)
+            return await _process_single_doc(db, doc_id, progress_callback=on_progress)
 
         # 启动处理任务
         task = asyncio.create_task(run_queued_process())

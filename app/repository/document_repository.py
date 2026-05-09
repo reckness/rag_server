@@ -50,6 +50,16 @@ class DocumentRepository:
         return db.query(Document).filter(Document.status == status).offset(skip).limit(limit).all()
     
     @staticmethod
+    def get_uploaded_ordered(db: Session, limit: int = 100) -> List[Document]:
+        return (
+            db.query(Document)
+            .filter(Document.status == "uploaded")
+            .order_by(Document.create_time.asc(), Document.update_time.asc())
+            .limit(limit)
+            .all()
+        )
+    
+    @staticmethod
     def get_all(db: Session, skip: int = 0, limit: int = 100) -> List[Document]:
         """获取文档列表"""
         return db.query(Document).offset(skip).limit(limit).all()

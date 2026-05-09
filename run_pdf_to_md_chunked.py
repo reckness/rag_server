@@ -20,6 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 全局 LLM 并发信号量：所有文档共享，限制同时发往 LLM 的请求总数
+GLOBAL_LLM_SEMAPHORE = threading.Semaphore(64)
+
 from rag.page_index_md import md_to_tree, extract_nodes_from_markdown, extract_node_text_content, build_tree_from_nodes, format_structure, generate_summaries_for_structure_md, write_node_id
 from rag.utils import _detect_headers_footers, _remove_headers_footers
 
@@ -58,7 +61,7 @@ def generate_doc_summary_from_chapter_summaries(structure):
 
 
 # ==================== 配置 ====================
-PDF_PATH = os.path.join("pdf", "珠三角电子信息产业集群创新网络演化及其机理研究_王炜.pdf")
+PDF_PATH = os.path.join("../dataset/dataset/", "中国数字经济发展研究报告（2024年）-中国信息通信研究院.pdf")
 LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
 LLM_MODEL = "qwen3.5-35b-int4"
 
@@ -78,7 +81,7 @@ ENABLE_SEMANTIC_PARAGRAPH_SPLIT = True
 SEMANTIC_SPLIT_SIMILARITY_THRESHOLD = 0.6
 SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS = 100
 SEMANTIC_SPLIT_MIN_SEGMENT_CHARS = 80
-SEMANTIC_SPLIT_EMBEDDING_WORKERS = 32
+SEMANTIC_SPLIT_EMBEDDING_WORKERS = 64
 
 ENABLE_PDF_CLEANING = True   # 是否启用 PDF 文本清洗规则
 
@@ -841,6 +844,7 @@ def chunk_text_to_markdown(chunk_title, chunk_text):
 6. 不要添加原文中没有的内容
 7. 直接输出 Markdown，不要用代码块包裹，不要输出任何其他说明文字
 8. 原始文章的目录进行删除。对原文语言有偏差的内容可以进行删除
+9. 尽量保持原文的段落结构，不要将原文中属于同一段落的内容拆分成多个段落。特别是当段落以"："结尾后面紧跟列举项（如"一是..."、"二是..."）时，应将总述句与列举项保持在同一段落中，而不是拆开
 
 PDF 提取文本：
 {chunk_text}
@@ -1293,31 +1297,10 @@ async def process_pdf_chunked(
         chunk_text = pages_to_chunk_text(cleaned_pages, chunk['start_page'], chunk['end_page'])
         chunk_texts.append(chunk_text)
 
-    # 动态并发控制：字符容量池
-    _cap_lock = threading.Lock()
-    _cap_cond = threading.Condition(_cap_lock)
-    _used_chars = [0]          # 当前占用的字符数
+    # 并发控制：使用全局 LLM 信号量（跨文档共享，限制总并发 64）
     _peak_concurrent = [0]     # 峰值并发数
     _running_count = [0]       # 当前并发任务数
-
-    def _acquire_capacity(char_count):
-        """获取字符容量，不足时阻塞等待"""
-        with _cap_cond:
-            while _used_chars[0] + char_count > CHAR_CAPACITY:
-                _cap_cond.wait()
-            _used_chars[0] += char_count
-            _running_count[0] += 1
-            if _running_count[0] > _peak_concurrent[0]:
-                _peak_concurrent[0] = _running_count[0]
-            print(f"  [调度] 占用 {char_count} 字符, 当前已用 {_used_chars[0]}/{CHAR_CAPACITY}, 并发 {_running_count[0]}")
-
-    def _release_capacity(char_count):
-        """释放字符容量，通知等待线程"""
-        with _cap_cond:
-            _used_chars[0] -= char_count
-            _running_count[0] -= 1
-            print(f"  [释放] 归还 {char_count} 字符, 当前已用 {_used_chars[0]}/{CHAR_CAPACITY}, 并发 {_running_count[0]}")
-            _cap_cond.notify_all()
+    _count_lock = threading.Lock()
 
     def _process_one_chunk(idx):
         """处理单个分块：LLM 转 MD + 构建子树（在线程中执行）"""
@@ -1331,15 +1314,23 @@ async def process_pdf_chunked(
             print(f"  [跳过] 空分块")
             return idx, None, []
 
-        # 获取容量（可能阻塞）
-        _acquire_capacity(char_count)
+        # 获取全局 LLM 信号量（可能阻塞）
+        GLOBAL_LLM_SEMAPHORE.acquire()
+        with _count_lock:
+            _running_count[0] += 1
+            if _running_count[0] > _peak_concurrent[0]:
+                _peak_concurrent[0] = _running_count[0]
+            print(f"  [调度] 分块 {idx+1}, 当前LLM并发 {_running_count[0]}")
         try:
             md_content = chunk_text_to_markdown(chunk['title'], chunk_text)
             subtree = build_subtree_from_markdown(md_content)
             print(f"  [完成] 分块 {idx+1} MD {len(md_content)} 字符, 子树 {len(subtree)} 个根节点")
             return idx, md_content, subtree
         finally:
-            _release_capacity(char_count)
+            GLOBAL_LLM_SEMAPHORE.release()
+            with _count_lock:
+                _running_count[0] -= 1
+                print(f"  [释放] 分块 {idx+1}, 当前LLM并发 {_running_count[0]}")
 
     # 并行执行（max_workers 设大，实际并发由容量池控制）
     step4_start = _time.time()
@@ -1506,36 +1497,25 @@ async def process_pdf_chunked(
 
         # 并行处理各章节摘要（字符容量池控制）
         if chapter_tasks:
-            _sum_lock = threading.Lock()
-            _sum_cond = threading.Condition(_sum_lock)
-            _sum_used = [0]
             _sum_peak = [0]
             _sum_running = [0]
-
-            def _acquire_sum_cap(cc):
-                with _sum_cond:
-                    while _sum_used[0] + cc > SUMMARY_CHAR_CAPACITY:
-                        _sum_cond.wait()
-                    _sum_used[0] += cc
-                    _sum_running[0] += 1
-                    if _sum_running[0] > _sum_peak[0]:
-                        _sum_peak[0] = _sum_running[0]
-
-            def _release_sum_cap(cc):
-                with _sum_cond:
-                    _sum_used[0] -= cc
-                    _sum_running[0] -= 1
-                    _sum_cond.notify_all()
+            _sum_lock = threading.Lock()
 
             def _summarize_chapter(task_tuple):
                 idx, chapter, text, cc = task_tuple
-                _acquire_sum_cap(cc)
+                GLOBAL_LLM_SEMAPHORE.acquire()
+                with _sum_lock:
+                    _sum_running[0] += 1
+                    if _sum_running[0] > _sum_peak[0]:
+                        _sum_peak[0] = _sum_running[0]
                 try:
                     title = chapter.get('title', '')
                     summary = _get_chapter_summary_sync(title, text)
                     return idx, chapter, summary
                 finally:
-                    _release_sum_cap(cc)
+                    GLOBAL_LLM_SEMAPHORE.release()
+                    with _sum_lock:
+                        _sum_running[0] -= 1
 
             summary_start = _time.time()
             with ThreadPoolExecutor(max_workers=len(chapter_tasks)) as executor:
