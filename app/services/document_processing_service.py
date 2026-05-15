@@ -16,7 +16,16 @@ from rag.json_to_es_converter_with_embedding import ESConverter
 from rag.build_router_es import DocumentRouter
 
 # 从配置文件导入Elasticsearch索引名称
-from common.config import ELASTICSEARCH_INDEX
+from common.config import (
+    ELASTICSEARCH_INDEX,
+    PDF_IF_ADD_NODE_TEXT,
+    PDF_MAX_TOKENS_PER_CHUNK,
+    PDF_PAGES_PER_CHUNK,
+    PDF_TOC_SCAN_PAGES,
+    RAG_BUCKET_NAME,
+    RAG_LLM_MODEL,
+)
+
 # 添加项目根目录到路径，以便导入 rag 模块
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -192,7 +201,7 @@ class DocumentProcessingService:
             # 4. 从MinIO获取文件
             minio_service = MinioService()
             # 使用固定的桶名"document"来获取文档文件
-            bucket_name = "deepsearch"
+            bucket_name = RAG_BUCKET_NAME
             source_path = document.source_path
             
             # 创建临时文件
@@ -225,13 +234,13 @@ class DocumentProcessingService:
                 # 注意：这里需要根据实际的page_index函数参数进行调整
                 page_index_output = await page_index(
                     temp_file_path,
-                    model="Qwen3-8B",  # 显式指定model参数
-                    toc_check_page_num=10,  
-                    max_page_num_each_node=10,
-                    max_token_num_each_node=10000,
+                    model=RAG_LLM_MODEL,  # 显式指定model参数
+                    toc_check_page_num=PDF_TOC_SCAN_PAGES,  
+                    max_page_num_each_node=PDF_PAGES_PER_CHUNK,
+                    max_token_num_each_node=PDF_MAX_TOKENS_PER_CHUNK,
                     if_add_node_id="yes",
                     if_add_node_summary="no",
-                    if_add_node_text="yes"
+                    if_add_node_text="yes" if PDF_IF_ADD_NODE_TEXT else "no"
                 )
                 
                 # 获取 LLM token 用量

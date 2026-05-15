@@ -17,7 +17,18 @@ from sqlalchemy.orm import Session
 from typing import Dict, Any, AsyncGenerator, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from common.config import ELASTICSEARCH_INDEX, MINIO_IP, MINIO_PORT
+from common.config import (
+    ELASTICSEARCH_INDEX,
+    MINIO_IP,
+    MINIO_PORT,
+    RAG_BUCKET_NAME,
+    RAG_DOC_THREAD_POOL_WORKERS,
+    RAG_LLM_MODEL,
+    RAG_LLM_URL,
+    RAG_OUTPUT_DIR,
+    RAG_PROCESS_BAT_CHAR_CAPACITY,
+    RAG_SHORT_DOC_TOKEN_THRESHOLD,
+)
 
 from ..core.database import SessionLocal
 from ..services.universal_rag_service import UniversalRagService
@@ -30,16 +41,16 @@ from rag.multi_index_writer import write_to_three_indices
 
 router = APIRouter()
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "pdf")
-BUCKET_NAME = "deepsearch"
-LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
-LLM_MODEL = "qwen3.5-35b-int4"
-PROCESS_BAT_CHAR_CAPACITY = int(os.getenv("PROCESS_BAT_CHAR_CAPACITY", "1000000"))
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), RAG_OUTPUT_DIR)
+BUCKET_NAME = RAG_BUCKET_NAME
+LLM_URL = RAG_LLM_URL
+LLM_MODEL = RAG_LLM_MODEL
+PROCESS_BAT_CHAR_CAPACITY = RAG_PROCESS_BAT_CHAR_CAPACITY
 PROCESS_BAT_CHAR_CAPACITY_CONDITION = asyncio.Condition()
 PROCESS_BAT_USED_CHARS = 0
 
 # 专用线程池：避免默认线程池（max_workers=5）成为瓶颈
-_DOC_THREAD_POOL = ThreadPoolExecutor(max_workers=64, thread_name_prefix="doc_proc")
+_DOC_THREAD_POOL = ThreadPoolExecutor(max_workers=RAG_DOC_THREAD_POOL_WORKERS, thread_name_prefix="doc_proc")
 
 
 async def _acquire_process_bat_char_capacity(char_count: int):
@@ -333,7 +344,15 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             temp_src_path = tmp.name
 
-        minio_service.download_file(BUCKET_NAME, document.source_path, temp_src_path)
+        download_ok = minio_service.download_file(BUCKET_NAME, document.source_path, temp_src_path)
+        if not download_ok:
+            raise RuntimeError(
+                f"MinIO 下载失败: bucket={BUCKET_NAME}, object={document.source_path}"
+            )
+        if not os.path.exists(temp_src_path) or os.path.getsize(temp_src_path) == 0:
+            raise RuntimeError(
+                f"MinIO 下载文件为空: bucket={BUCKET_NAME}, object={document.source_path}"
+            )
         await _notify(10.0, "文件下载完成")
 
         # --- 2. 转换为 PDF（如果不是 PDF）---
@@ -348,7 +367,13 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
             # 上传 PDF 到 MinIO，路径与 source_path 对应（仅替换扩展名）
             source_no_ext = os.path.splitext(document.source_path)[0]
             pdf_object_name = source_no_ext + ".pdf"
-            minio_service.upload_file(BUCKET_NAME, pdf_object_name, temp_pdf_path, content_type="application/pdf")
+            pdf_upload_ok = minio_service.upload_file(
+                BUCKET_NAME, pdf_object_name, temp_pdf_path, content_type="application/pdf"
+            )
+            if not pdf_upload_ok:
+                raise RuntimeError(
+                    f"MinIO 上传 PDF 失败: bucket={BUCKET_NAME}, object={pdf_object_name}"
+                )
             _update_document(pdf_path=pdf_object_name)
             await _notify(20.0, "PDF 转换并上传完成")
         else:
@@ -367,13 +392,13 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         pdf_doc.close()
         char_count = len(full_text)
         estimated_tokens = int(char_count / 1.5)
-        await _notify(25.0, f"文档字符数 {char_count}，全局字符容量池 {PROCESS_BAT_CHAR_CAPACITY}，估算 {estimated_tokens} tokens，使用 {'simple' if estimated_tokens <= 8000 else 'chunked'} 模式")
+        await _notify(25.0, f"文档字符数 {char_count}，全局字符容量池 {PROCESS_BAT_CHAR_CAPACITY}，估算 {estimated_tokens} tokens，使用 {'simple' if estimated_tokens <= RAG_SHORT_DOC_TOKEN_THRESHOLD else 'chunked'} 模式")
 
         capacity_cost, used_chars = await _acquire_process_bat_char_capacity(char_count)
         await _notify(30.0, f"占用 {capacity_cost} 字符，当前已用 {used_chars}/{PROCESS_BAT_CHAR_CAPACITY}，开始解析")
         print(f"[process_bat调度] doc_id={doc_id} 占用 {capacity_cost} 字符，当前已用 {used_chars}/{PROCESS_BAT_CHAR_CAPACITY}")
         try:
-            if estimated_tokens <= 8000:
+            if estimated_tokens <= RAG_SHORT_DOC_TOKEN_THRESHOLD:
                 from run_pdf_to_md import process_pdf_simple
                 output = await asyncio.get_event_loop().run_in_executor(
                     _DOC_THREAD_POOL,
@@ -406,7 +431,11 @@ async def _process_single_doc(db: Session, doc_id: str, progress_callback=None) 
         # 上传 JSON 到 MinIO，路径与 source_path 对应（仅替换扩展名）
         source_no_ext = os.path.splitext(document.source_path)[0]
         json_object_name = source_no_ext + ".json"
-        minio_service.upload_file(BUCKET_NAME, json_object_name, json_path)
+        json_upload_ok = minio_service.upload_file(BUCKET_NAME, json_object_name, json_path)
+        if not json_upload_ok:
+            raise RuntimeError(
+                f"MinIO 上传 JSON 失败: bucket={BUCKET_NAME}, object={json_object_name}"
+            )
 
         _update_document(pageindex_path=json_object_name)
         await _notify(50.0, "文件解析完成，JSON 已上传")

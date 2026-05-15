@@ -27,7 +27,6 @@ class EmbeddingClient:
         payload = {
             "model": self.model_name,
             "input": [text[:8000]],  # 限制文本长度
-            "dimensions": self.embedding_dim
         }
         
         try:

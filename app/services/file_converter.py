@@ -12,16 +12,14 @@ import urllib.parse
 
 import requests
 
+from common.config import (
+    LIBREOFFICE_CONVERT_TIMEOUT,
+    ONLINE_PREVIEW_BASE_URL,
+    SUPPORTED_CONVERT_EXTENSIONS,
+)
 
 # 支持的源格式 → 分组
-SUPPORTED_EXTENSIONS = {
-    ".doc", ".docx",       # Word
-    ".txt", ".json",       # 文本
-    ".ppt", ".pptx",       # PPT
-    ".xls", ".xlsx",       # Excel
-}
-
-ONLINE_PREVIEW_BASE_URL = os.getenv("ONLINE_PREVIEW_BASE_URL", "http://10.1.140.215:8012")
+SUPPORTED_EXTENSIONS = SUPPORTED_CONVERT_EXTENSIONS
 
 
 def is_supported(filename: str) -> bool:
@@ -61,7 +59,7 @@ def _run_libreoffice_convert(source_path: str, output_dir: str, target_format: s
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=LIBREOFFICE_CONVERT_TIMEOUT,
         )
     finally:
         shutil.rmtree(profile_dir, ignore_errors=True)

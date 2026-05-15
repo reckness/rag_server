@@ -122,23 +122,19 @@ class RagService:
         query_vec = await get_embedding(query)
 
         # 2️⃣ 第一重：doc_index 混合召回（宽松，有就召回）
-        doc_ids = self.es.retrieve_docs(query, kb_ids, fd_ids, query_vec,topk=20)
+        doc_ids = self.es.retrieve_docs(query, kb_ids, fd_ids, query_vec, topk=20)
 
         if not doc_ids:
             return {"chunks": [], "context": ""}
 
-        # 3️⃣ 第二重：chapter_index 章节召回（KNN + BM25 RRF）
-        chapter_ids, chapter_results = self.es.retrieve_chapters(query, query_vec, doc_ids, kb_ids)
-
-        if not chapter_ids:
-            return {"chunks": [], "context": ""}
-
-        # 4️⃣ 第三重：chunk_index 精细召回（KNN + BM25 RRF）
-        chunks = self.es.retrieve_chunks(query, query_vec, chapter_ids, kb_ids, doc_ids)
+        # 3️⃣ 直接 chunk 召回（跳过 chapter 级，消除漏斗瓶颈）
+        chunks = self.es.retrieve_chunks_by_docs(query, query_vec, doc_ids, kb_ids)
 
         # 5️⃣ rerank + Sigmoid 映射最终 _score
         if req.use_rerank:
             try:
+                chunks.sort(key=lambda x: x.get("_score", 0), reverse=True)
+                chunks = chunks[:30]
                 chunks = await rerank(query, chunks, model)
 
                 rerank_scores = []

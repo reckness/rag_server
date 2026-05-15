@@ -24,6 +24,10 @@ from common.nlp.embedding_client import get_embedding
 logger = logging.getLogger(__name__)
 
 
+def _fallback_embedding():
+    return [1.0] + [0.0] * (EMBEDDING_DIM - 1)
+
+
 # ==================== Mapping 定义 ====================
 
 DOC_INDEX_MAPPING = {
@@ -238,7 +242,7 @@ def write_to_three_indices(
     doc_embedding_source = doc_summary if doc_summary else doc_name
     doc_embedding = get_embedding(doc_embedding_source) if doc_embedding_source else []
     if not doc_embedding:
-        doc_embedding = [0.0] * EMBEDDING_DIM
+        doc_embedding = _fallback_embedding()
 
     doc_record = {
         "doc_id": doc_id,
@@ -276,7 +280,7 @@ def write_to_three_indices(
         embedding_source = chapter_summary if chapter_summary else chapter_name
         embedding = get_embedding(embedding_source)
         if not embedding:
-            embedding = [0.0] * EMBEDDING_DIM
+            embedding = _fallback_embedding()
 
         chapter_actions.append({
             "_index": ELASTICSEARCH_CHAPTER_INDEX,
@@ -344,7 +348,7 @@ def write_to_three_indices(
         chunk_text = rec.get("chunk_text", "")
         embedding = get_embedding(chunk_text) if chunk_text else []
         if not embedding:
-            embedding = [0.0] * EMBEDDING_DIM
+            embedding = _fallback_embedding()
         rec["embedding"] = embedding
 
     # 分批 bulk 写入

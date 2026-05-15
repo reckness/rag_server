@@ -9,7 +9,16 @@ from ..core.database import SessionLocal
 from ..utils.response import ApiResponse
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from common.config import ELASTICSEARCH_INDEX
+from common.config import (
+    ELASTICSEARCH_INDEX,
+    PDF_IF_ADD_NODE_TEXT,
+    PDF_IF_SUMMARY,
+    RAG_BUCKET_NAME,
+    RAG_LLM_MODEL,
+    RAG_LLM_URL,
+    RAG_OUTPUT_DIR,
+    RAG_SHORT_DOC_TOKEN_THRESHOLD,
+)
 from rag.json_to_es_converter_with_embedding import ESConverter
 from rag.build_router_es import DocumentRouter
 
@@ -29,7 +38,7 @@ def get_db():
 # POST /pdf/process/{doc_id}
 # 从数据库获取文档 → MinIO 下载 → run_pdf_to_md_chunked 解析 → 写入 ES → 更新数据库
 # ---------------------------------------------------------------------------
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "pdf")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), RAG_OUTPUT_DIR)
 
 
 @router.post("/process/{doc_id}", summary="处理文档（PDF解析 + 写入ES + 更新数据库）")
@@ -72,7 +81,7 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
     try:
         # 2. 从 MinIO 下载文件
         minio_service = MinioService()
-        bucket_name = "deepsearch"
+        bucket_name = RAG_BUCKET_NAME
         suffix = os.path.splitext(document.title)[1] or ".pdf"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             temp_file_path = tmp.name
@@ -95,24 +104,21 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
         # 中文约 1.5 字符/token
         estimated_tokens = int(len(full_text) / 1.5)
 
-        LLM_URL = "http://10.1.141.33:8001/v1/chat/completions"
-        LLM_MODEL = "Qwen3-8B"
-
-        if estimated_tokens <= 8000:
+        if estimated_tokens <= RAG_SHORT_DOC_TOKEN_THRESHOLD:
             from run_pdf_to_md import process_pdf_simple
             output = await process_pdf_simple(
                 pdf_path=temp_file_path,
                 output_dir=OUTPUT_DIR,
-                llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=True, if_add_node_text=True,
+                llm_url=RAG_LLM_URL, llm_model=RAG_LLM_MODEL, model=RAG_LLM_MODEL,
+                if_summary=PDF_IF_SUMMARY, if_add_node_text=PDF_IF_ADD_NODE_TEXT,
             )
         else:
             from run_pdf_to_md_chunked import process_pdf_chunked
             output = await process_pdf_chunked(
                 pdf_path=temp_file_path,
                 output_dir=OUTPUT_DIR,
-                llm_url=LLM_URL, llm_model=LLM_MODEL, model=LLM_MODEL,
-                if_summary=True, if_add_node_text=True,
+                llm_url=RAG_LLM_URL, llm_model=RAG_LLM_MODEL, model=RAG_LLM_MODEL,
+                if_summary=PDF_IF_SUMMARY, if_add_node_text=PDF_IF_ADD_NODE_TEXT,
             )
         json_path = output["json_path"]
 
@@ -180,7 +186,7 @@ async def process_document(doc_id: str, db: Session = Depends(get_db)):
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-        mode_used = "simple" if estimated_tokens <= 8000 else "chunked"
+        mode_used = "simple" if estimated_tokens <= RAG_SHORT_DOC_TOKEN_THRESHOLD else "chunked"
         return ApiResponse.success(data={
             "success": True,
             "document_id": document.doc_id,

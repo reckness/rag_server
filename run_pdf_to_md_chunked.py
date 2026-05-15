@@ -20,6 +20,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from common.config import (
+    LLM_REQUEST_TIMEOUT,
+    PDF_CHUNK_TOKEN_THRESHOLD,
+    PDF_ENABLE_CLEANING,
+    PDF_ENABLE_SEMANTIC_PARAGRAPH_SPLIT,
+    PDF_IF_ADD_NODE_TEXT,
+    PDF_IF_SUMMARY,
+    PDF_IF_THINNING,
+    PDF_MAX_TOKENS_PER_CHUNK,
+    PDF_MERGE_SMALL_CHUNKS,
+    PDF_SEMANTIC_SPLIT_EMBEDDING_WORKERS,
+    PDF_SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS,
+    PDF_SEMANTIC_SPLIT_MIN_SEGMENT_CHARS,
+    PDF_SEMANTIC_SPLIT_SIMILARITY_THRESHOLD,
+    PDF_SIMPLE_MODEL,
+    PDF_SMALL_CHUNK_CHAR_THRESHOLD,
+    PDF_SUMMARY_TOKEN_THRESHOLD,
+    PDF_THINNING_THRESHOLD,
+    PDF_TOC_SCAN_PAGES,
+    RAG_LLM_MODEL,
+    RAG_LLM_URL,
+)
+
 # 全局 LLM 并发信号量：所有文档共享，限制同时发往 LLM 的请求总数
 GLOBAL_LLM_SEMAPHORE = threading.Semaphore(64)
 
@@ -62,28 +85,28 @@ def generate_doc_summary_from_chapter_summaries(structure):
 
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("../dataset/dataset/", "中国数字经济发展研究报告（2024年）-中国信息通信研究院.pdf")
-LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
-LLM_MODEL = "qwen3.5-35b-int4"
+LLM_URL = RAG_LLM_URL
+LLM_MODEL = RAG_LLM_MODEL
 
-MODEL = "qwen3.5-35b-int4"
-IF_THINNING = False
-THINNING_THRESHOLD = 5000
-SUMMARY_TOKEN_THRESHOLD = 200
-IF_SUMMARY = True
-IF_ADD_NODE_TEXT = True
+MODEL = PDF_SIMPLE_MODEL
+IF_THINNING = PDF_IF_THINNING
+THINNING_THRESHOLD = PDF_THINNING_THRESHOLD
+SUMMARY_TOKEN_THRESHOLD = PDF_SUMMARY_TOKEN_THRESHOLD
+IF_SUMMARY = PDF_IF_SUMMARY
+IF_ADD_NODE_TEXT = PDF_IF_ADD_NODE_TEXT
 
-TOC_SCAN_PAGES = 15          # 扫描前 N 页寻找目录
-MAX_TOKENS_PER_CHUNK = 6000  # 每个分块最大字符数（安全阈值）
-CHUNK_TOKEN_THRESHOLD = 20000  # 章节 token 超过此阈值则按小节拆分
-MERGE_SMALL_CHUNKS = True
-SMALL_CHUNK_CHAR_THRESHOLD = 100
-ENABLE_SEMANTIC_PARAGRAPH_SPLIT = True
-SEMANTIC_SPLIT_SIMILARITY_THRESHOLD = 0.6
-SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS = 100
-SEMANTIC_SPLIT_MIN_SEGMENT_CHARS = 80
-SEMANTIC_SPLIT_EMBEDDING_WORKERS = 64
+TOC_SCAN_PAGES = PDF_TOC_SCAN_PAGES
+MAX_TOKENS_PER_CHUNK = PDF_MAX_TOKENS_PER_CHUNK
+CHUNK_TOKEN_THRESHOLD = PDF_CHUNK_TOKEN_THRESHOLD
+MERGE_SMALL_CHUNKS = PDF_MERGE_SMALL_CHUNKS
+SMALL_CHUNK_CHAR_THRESHOLD = PDF_SMALL_CHUNK_CHAR_THRESHOLD
+ENABLE_SEMANTIC_PARAGRAPH_SPLIT = PDF_ENABLE_SEMANTIC_PARAGRAPH_SPLIT
+SEMANTIC_SPLIT_SIMILARITY_THRESHOLD = PDF_SEMANTIC_SPLIT_SIMILARITY_THRESHOLD
+SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS = PDF_SEMANTIC_SPLIT_MIN_PARAGRAPH_CHARS
+SEMANTIC_SPLIT_MIN_SEGMENT_CHARS = PDF_SEMANTIC_SPLIT_MIN_SEGMENT_CHARS
+SEMANTIC_SPLIT_EMBEDDING_WORKERS = PDF_SEMANTIC_SPLIT_EMBEDDING_WORKERS
 
-ENABLE_PDF_CLEANING = True   # 是否启用 PDF 文本清洗规则
+ENABLE_PDF_CLEANING = PDF_ENABLE_CLEANING
 
 # ==================== Step 1: 提取 PDF 页面文本 ====================
 def _table_data_to_markdown(data):
@@ -802,8 +825,8 @@ def refine_chunks_by_token(chunks, toc_entries, cleaned_pages, token_threshold=C
 
 
 # ==================== Step 4: LLM 转 Markdown ====================
-def llm_call(prompt, max_tokens=8192, retries=2):
-    """调用 LLM（含重试）"""
+def llm_call(prompt, max_tokens=8192, retries=3):
+    """调用 LLM（含指数退避重试）"""
     headers = {"Content-Type": "application/json", "Authorization": "Bearer "}
     payload = {
         "model": LLM_MODEL,
@@ -814,16 +837,23 @@ def llm_call(prompt, max_tokens=8192, retries=2):
     }
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=900)
+            resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=LLM_REQUEST_TIMEOUT)
+            if resp.status_code == 503 or resp.status_code == 429:
+                raise requests.exceptions.ConnectionError(
+                    f"LLM 服务暂时不可用 (status={resp.status_code})")
             if resp.status_code != 200:
                 print(f"  [LLM错误] status={resp.status_code}, prompt长度={len(prompt)}, "
                       f"响应={resp.text[:500]}", flush=True)
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                ConnectionRefusedError) as e:
             if attempt < retries:
-                wait = 10 * (attempt + 1)
-                print(f"  [LLM重试] {type(e).__name__}, {wait}s 后重试 ({attempt+1}/{retries})", flush=True)
+                wait = 15 * (3 ** attempt)  # 15s, 45s, 135s
+                print(f"  [LLM重试] {type(e).__name__}, {wait}s 后重试 "
+                      f"({attempt+1}/{retries})", flush=True)
                 _time.sleep(wait)
             else:
                 raise

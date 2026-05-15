@@ -19,6 +19,7 @@ import logging
 import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
+from common.config import LLM_REQUEST_TIMEOUT, RAG_LLM_MODEL, RAG_LLM_URL
 
 # Backward compatibility: support CHATGPT_API_KEY as alias for OPENAI_API_KEY
 if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
@@ -33,7 +34,7 @@ def count_tokens(text, model=None):
     # 简单的token计数近似
     return len(text.split())
 
-def calculate_token_size(payload, model_name="qwen3.5-35b-int4"):
+def calculate_token_size(payload, model_name=RAG_LLM_MODEL):
     """
     计算请求的token大小
     
@@ -92,13 +93,13 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             # 记录开始时间
             start_time = time.time()
             
-            url = "http://10.1.141.33:8080/v1/chat/completions"
+            url = RAG_LLM_URL
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer "
             }
             payload = {
-                "model": "qwen3.5-35b-int4",
+                "model": RAG_LLM_MODEL,
                 "messages": messages,
                 "max_tokens": 4096,
                 "chat_template_kwargs": {
@@ -117,7 +118,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             input_tokens = calculate_token_size(payload)
             if not isinstance(input_tokens, Exception):
                 print(f"实际输入 token 数: {input_tokens}")
-            response = requests.post(url, headers=headers, json=payload, timeout=300)
+            response = requests.post(url, headers=headers, json=payload, timeout=LLM_REQUEST_TIMEOUT)
             print(f"响应状态码: {response.status_code}")
             print(f"响应头: {dict(response.headers)}")
             print(f"响应内容长度: {len(response.text)}")
@@ -212,13 +213,13 @@ async def llm_acompletion(model, prompt):
             # 记录开始时间
             start_time = time.time()
             
-            url = "http://10.1.141.33:8080/v1/chat/completions"
+            url = RAG_LLM_URL
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer "
             }
             payload = {
-                "model": "qwen3.5-35b-int4",
+                "model": RAG_LLM_MODEL,
                 "messages": messages,
                 "max_tokens": 4096,
                 "chat_template_kwargs": {
@@ -238,7 +239,7 @@ async def llm_acompletion(model, prompt):
             input_tokens = calculate_token_size(payload)
             if not isinstance(input_tokens, Exception):
                 print(f"实际输入 token 数: {input_tokens}")
-            response = requests.post(url, headers=headers, json=payload, timeout=300)
+            response = requests.post(url, headers=headers, json=payload, timeout=LLM_REQUEST_TIMEOUT)
             print(f"响应状态码: {response.status_code}")
             print(f"响应头: {dict(response.headers)}")
             print(f"响应内容长度: {len(response.text)}")

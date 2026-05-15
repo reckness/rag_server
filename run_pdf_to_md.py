@@ -8,9 +8,20 @@ import asyncio
 import sys
 import os
 import json
-import re
-import requests
 import pymupdf
+import requests
+
+from common.config import (
+    LLM_REQUEST_TIMEOUT,
+    PDF_IF_ADD_NODE_TEXT,
+    PDF_IF_SUMMARY,
+    PDF_IF_THINNING,
+    PDF_SIMPLE_LLM_MODEL,
+    PDF_SIMPLE_LLM_URL,
+    PDF_SIMPLE_MODEL,
+    PDF_SUMMARY_TOKEN_THRESHOLD,
+    PDF_THINNING_THRESHOLD,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,16 +64,16 @@ def generate_doc_summary_from_chapter_summaries(structure):
 
 # ==================== 配置 ====================
 PDF_PATH = os.path.join("pdf", "辽宁省低空经济高质量发展路径研究.pdf")
-LLM_URL = "http://10.1.141.33:8080/v1/chat/completions"
-LLM_MODEL = "qwen3.5-35b-int4"
+LLM_URL = PDF_SIMPLE_LLM_URL
+LLM_MODEL = PDF_SIMPLE_LLM_MODEL
 
 # md_to_tree 参数
-MODEL = "qwen3.5-35b-int4"
-IF_THINNING = False
-THINNING_THRESHOLD = 5000
-SUMMARY_TOKEN_THRESHOLD = 200
-IF_SUMMARY = True          # 是否生成摘要
-IF_ADD_NODE_TEXT = True     # 是否保留节点文本
+MODEL = PDF_SIMPLE_MODEL
+IF_THINNING = PDF_IF_THINNING
+THINNING_THRESHOLD = PDF_THINNING_THRESHOLD
+SUMMARY_TOKEN_THRESHOLD = PDF_SUMMARY_TOKEN_THRESHOLD
+IF_SUMMARY = PDF_IF_SUMMARY
+IF_ADD_NODE_TEXT = PDF_IF_ADD_NODE_TEXT
 
 
 # ==================== Step 1: 提取 PDF 文本（自动去除页眉页脚） ====================
@@ -98,8 +109,8 @@ def extract_pdf_text(pdf_path):
 
 
 # ==================== Step 2: LLM 将文本转为 Markdown ====================
-def llm_call(prompt, max_tokens=8192):
-    """调用 LLM"""
+def llm_call(prompt, max_tokens=8192, retries=3):
+    """调用 LLM（含指数退避重试）"""
     headers = {"Content-Type": "application/json", "Authorization": "Bearer "}
     payload = {
         "model": LLM_MODEL,
@@ -108,9 +119,29 @@ def llm_call(prompt, max_tokens=8192):
         "chat_template_kwargs": {"enable_thinking": False},
         "temperature": 0
     }
-    resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=300)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(LLM_URL, headers=headers, json=payload, timeout=LLM_REQUEST_TIMEOUT)
+            if resp.status_code == 503 or resp.status_code == 429:
+                raise requests.exceptions.ConnectionError(
+                    f"LLM 服务暂时不可用 (status={resp.status_code})")
+            if resp.status_code != 200:
+                print(f"  [LLM错误] status={resp.status_code}, prompt长度={len(prompt)}, "
+                      f"响应={resp.text[:500]}", flush=True)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                ConnectionRefusedError) as e:
+            if attempt < retries:
+                wait = 15 * (3 ** attempt)  # 15s, 45s, 135s
+                print(f"  [LLM重试] {type(e).__name__}, {wait}s 后重试 "
+                      f"({attempt+1}/{retries})", flush=True)
+                import time
+                time.sleep(wait)
+            else:
+                raise
 
 
 def pdf_text_to_markdown(pdf_text):

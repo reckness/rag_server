@@ -59,7 +59,7 @@ class ESService:
                     "field": "embedding",
                     "query_vector": query_vec,
                     "k": topk,
-                    "num_candidates": 200,
+                    "num_candidates": 500,
                     "filter": doc_filter,
                 },
                 "_source": ["doc_id"],
@@ -112,7 +112,7 @@ class ESService:
                 "field": "embedding",
                 "query_vector": query_vec,
                 "k": topk,
-                "num_candidates": 200,
+                "num_candidates": 500,
             },
             "_source": ["doc_id", "chapter_id", "chapter_name"],
         }
@@ -184,7 +184,7 @@ class ESService:
                 "field": "embedding",
                 "query_vector": query_vec,
                 "k": topk,
-                "num_candidates": 200,
+                "num_candidates": 500,
             },
             "_source": {"excludes": ["embedding"]},
         }
@@ -228,6 +228,72 @@ class ESService:
         for key, score in rrf_scores.items():
             if score >= rrf_threshold:
                 merged.append({**doc_sources[key], "_score": score})
+        merged.sort(key=lambda x: x["_score"], reverse=True)
+
+        return merged[:topk]
+
+    # ================================================================
+    # 二级检索：doc → chunk 直接召回（跳过 chapter 级）
+    # ================================================================
+    def retrieve_chunks_by_docs(self, query, query_vec, doc_ids, kb_ids=None,
+                                topk=100, rrf_k=60):
+        """跳过 chapter 级，直接在候选 doc 中做 KNN + BM25 RRF 精细召回"""
+        filters = []
+        if doc_ids:
+            filters.append({"terms": {"doc_id": doc_ids}})
+        if kb_ids:
+            filters.append({"terms": {"kb_id": kb_ids}})
+        chunk_filter = {"bool": {"must": filters}} if filters else None
+
+        # --- KNN ---
+        knn_body = {
+            "size": topk,
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_vec,
+                "k": topk,
+                "num_candidates": 500,
+            },
+            "_source": {"excludes": ["embedding"]},
+        }
+        if chunk_filter:
+            knn_body["knn"]["filter"] = chunk_filter
+
+        knn_res = self.es.search(index=ELASTICSEARCH_CHUNK_INDEX, body=knn_body)
+
+        # --- BM25 ---
+        bm25_body = {
+            "size": topk,
+            "query": {
+                "bool": {
+                    "must": [{"match": {"chunk_text": {"query": query}}}],
+                }
+            },
+            "_source": {"excludes": ["embedding"]},
+        }
+        if chunk_filter:
+            bm25_body["query"]["bool"]["filter"] = chunk_filter
+
+        bm25_res = self.es.search(index=ELASTICSEARCH_CHUNK_INDEX, body=bm25_body)
+
+        # --- RRF 融合（无阈值截断，全部保留让 rerank 决定）---
+        rrf_scores: Dict[str, float] = {}
+        doc_sources: Dict[str, Dict] = {}
+
+        for rank, hit in enumerate(knn_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            doc_sources[key] = hit["_source"]
+
+        for rank, hit in enumerate(bm25_res["hits"]["hits"], start=1):
+            key = hit["_id"]
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank)
+            if key not in doc_sources:
+                doc_sources[key] = hit["_source"]
+
+        merged = []
+        for key, score in rrf_scores.items():
+            merged.append({**doc_sources[key], "_score": score})
         merged.sort(key=lambda x: x["_score"], reverse=True)
 
         return merged[:topk]

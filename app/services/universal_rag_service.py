@@ -37,6 +37,14 @@ from rag.page_index import check_toc
 from rag.page_index import page_index
 from rag.utils import get_token_count, reset_token_count
 from rag.multi_index_writer import write_to_three_indices
+from common.config import (
+    PDF_IF_ADD_NODE_TEXT,
+    PDF_MAX_TOKENS_PER_CHUNK,
+    PDF_PAGES_PER_CHUNK,
+    PDF_TOC_SCAN_PAGES,
+    RAG_BUCKET_NAME,
+    RAG_LLM_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +134,7 @@ class UniversalRagService:
         try:
             # ── 2. 从 MinIO 下载文件 ────────────────────────────────────
             minio_service = MinioService()
-            bucket_name = "deepsearch"
+            bucket_name = RAG_BUCKET_NAME
             source_path = document.source_path
 
             suffix = os.path.splitext(document.title)[1] or ".tmp"
@@ -282,13 +290,13 @@ class UniversalRagService:
                 reset_token_count()
                 json_path = await page_index(
                     file_path,
-                    model="Qwen3-8B",
-                    toc_check_page_num=10,
-                    max_page_num_each_node=10,
-                    max_token_num_each_node=10000,
+                    model=RAG_LLM_MODEL,
+                    toc_check_page_num=PDF_TOC_SCAN_PAGES,
+                    max_page_num_each_node=PDF_PAGES_PER_CHUNK,
+                    max_token_num_each_node=PDF_MAX_TOKENS_PER_CHUNK,
                     if_add_node_id="yes",
                     if_add_node_summary="no",
-                    if_add_node_text="yes",
+                    if_add_node_text="yes" if PDF_IF_ADD_NODE_TEXT else "no",
                 )
                 token_count = get_token_count()
                 llm_token = token_count.get("input", 0) + token_count.get("output", 0)
@@ -309,7 +317,7 @@ class UniversalRagService:
         try:
             print("开始检测 TOC")
             # 构建临时 opt 供 check_toc 使用
-            opt = ConfigLoader().load({"model": "Qwen3-8B", "toc_check_page_num": 10})
+            opt = ConfigLoader().load({"model": RAG_LLM_MODEL, "toc_check_page_num": PDF_TOC_SCAN_PAGES})
             page_list = get_page_tokens(file_path, model=opt.model)
             print("页面文本提取完成")
             toc_result = check_toc(page_list, opt)
@@ -334,13 +342,13 @@ class UniversalRagService:
                 reset_token_count()
                 json_path = await page_index(
                     file_path,
-                    model="Qwen3-8B",
-                    toc_check_page_num=10,
-                    max_page_num_each_node=10,
-                    max_token_num_each_node=10000,
+                    model=RAG_LLM_MODEL,
+                    toc_check_page_num=PDF_TOC_SCAN_PAGES,
+                    max_page_num_each_node=PDF_PAGES_PER_CHUNK,
+                    max_token_num_each_node=PDF_MAX_TOKENS_PER_CHUNK,
                     if_add_node_id="yes",
                     if_add_node_summary="no",
-                    if_add_node_text="yes",
+                    if_add_node_text="yes" if PDF_IF_ADD_NODE_TEXT else "no",
                 )
                 token_count = get_token_count()
                 llm_token = token_count.get("input", 0) + token_count.get("output", 0)

@@ -1,7 +1,7 @@
 import asyncio
 import httpx
 
-RERANK_URL = "http://10.1.141.33:8474/rerank"
+from common.config import RERANK_TIMEOUT, RERANK_URL
 
 
 async def rerank(query, chunks, model=None):
@@ -23,7 +23,7 @@ async def rerank(query, chunks, model=None):
             "documents": documents,
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=RERANK_TIMEOUT) as client:
             resp = await client.post(RERANK_URL, json=payload)
             resp.raise_for_status()
             result = resp.json()
